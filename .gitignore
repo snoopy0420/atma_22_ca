@@ -1,6 +1,8 @@
 .DS_STORE
 *.DS_Store
 .ipynb_checkpoints
+*.pyc
+__pycache__/
 data/external/*
 !data/external/.gitkeep
 data/features/*
