@@ -251,3 +251,10 @@ class Runner:
         self.logger.info(f"Submission saved: {save_path}")
         
         return save_path
+    
+    
+    def load_model_cv(self, i_fold: int) -> Model:
+        """指定foldのモデルを読み込み"""
+        model = self.build_model(i_fold)
+        model.load_model()
+        return model
