@@ -28,8 +28,8 @@ notebooks/bk/*
 *.gsheet
 *.bin
 *.pt
-sample_code/1th_place_solution/*
-!sample_code/1th_place_solution/atmacup20-solution-discussion.ipynb
-sample_code/3th_place_solution/*
-!sample_code/3th_place_solution/takaito.ipynb
+sample_code/*
+!sample_code/.gitkeep
+!sample_code/**/*.ipynb
+!sample_code/**/*.py
 .env
