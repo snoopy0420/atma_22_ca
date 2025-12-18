@@ -19,16 +19,18 @@ from configs.config import *
 class BasketballDataset(Dataset):
     """バスケットボール選手識別用Dataset"""
     
-    def __init__(self, df: pd.DataFrame, transform=None, is_train=True):
+    def __init__(self, df: pd.DataFrame, transform=None, is_train=True, use_crops=False):
         """
         Args:
             df: メタデータDataFrame
             transform: データ拡張・前処理
             is_train: 訓練データかどうか
+            use_crops: テストデータで切り抜き済み画像(crops)を使用するか
         """
         self.df = df.reset_index(drop=True)
         self.transform = transform
         self.is_train = is_train
+        self.use_crops = use_crops
         
     def __len__(self):
         return len(self.df)
@@ -51,6 +53,27 @@ class BasketballDataset(Dataset):
     
     def _load_and_crop(self, row):
         """画像読み込みとbbox切り出し（最適化版）"""
+        # リスタート後: テストデータは切り抜き済み画像を使用
+        if self.use_crops and 'rel_path' in row and pd.notna(row['rel_path']):
+            # 切り抜き済み画像を直接読み込み
+            from configs.config import DIR_INPUT
+            img_path = os.path.join(DIR_INPUT, row['rel_path'])
+            
+            if not os.path.exists(img_path):
+                raise FileNotFoundError(f"⚠️ Cropped image not found: {img_path}")
+            img = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
+            if img is None:
+                raise ValueError(f"⚠️ Failed to read cropped image: {img_path}")
+            
+            # BGR→RGB変換
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            
+            # リサイズ（INTER_AREAで縮小最適化）
+            resized = cv2.resize(img, (224, 224), interpolation=cv2.INTER_AREA)
+            
+            return resized
+        
+        # 学習データ: 元の処理（完全な画像からbbox切り出し）
         # 画像パス
         img_path = os.path.join(
             DIR_IMAGE,

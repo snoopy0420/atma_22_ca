@@ -144,8 +144,10 @@ class ModelResNet50Base(Model):
         
         # Dataset & DataLoader作成
         is_train = (split == 'train')
+        # テストデータのみ切り抜き済み画像を使用（validは学習データの一部なので完全な画像から切り出し）
+        use_crops = (split == 'test')
         transform = get_transforms(is_train=False)  # Phase 1では拡張なし
-        dataset = BasketballDataset(df, transform=transform, is_train=is_train)
+        dataset = BasketballDataset(df, transform=transform, is_train=is_train, use_crops=use_crops)
         
         use_cuda = torch.cuda.is_available()
         dataloader = DataLoader(

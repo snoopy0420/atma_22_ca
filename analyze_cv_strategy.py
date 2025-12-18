@@ -6,8 +6,8 @@ import pandas as pd
 import numpy as np
 
 # データ読み込み
-train_df = pd.read_csv('data/raw/input/atmaCup22_metadata/train_meta.csv')
-test_df = pd.read_csv('data/raw/input/atmaCup22_metadata/test_meta.csv')
+train_df = pd.read_csv('data/raw/input/atmaCup22_2nd_meta/train_meta.csv')
+test_df = pd.read_csv('data/raw/input/atmaCup22_2nd_meta/test_meta.csv')
 
 print("="*80)
 print("📊 データ構造分析")

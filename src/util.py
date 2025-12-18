@@ -66,6 +66,85 @@ class Util:
         """特徴量ファイルを読み込み"""
         file_name = file_name if file_name.endswith('.pkl') else file_name + ".pkl"
         return pd.read_pickle(os.path.join(DIR_FEATURE, file_name))
+    
+    @classmethod
+    def save_submission(cls, submission: pd.DataFrame, run_name: str, suffix: str = "", logger=None) -> str:
+        """提出ファイル保存（後方互換性のため残す）
+        
+        Note: Submissionクラスの使用を推奨
+        """
+        return Submission.save(submission, run_name, suffix, logger)
+
+
+class Submission:
+    """提出ファイル管理クラス"""
+    
+    @staticmethod
+    def save(submission: pd.DataFrame, run_name: str, logger=None) -> str:
+        """提出ファイル保存
+        
+        Args:
+            submission: 提出用DataFrame（label_id列を持つ）
+            run_name: 実行名
+            suffix: ファイル名のサフィックス（オプション）
+            logger: ロガー（オプション）
+        
+        Returns:
+            保存先のパス
+        
+        Examples:
+            >>> submission = pd.DataFrame({'label_id': predictions})
+            >>> Submission.save(submission, 'resnet50_knn', 'tuned')
+            'data/submission/submission_resnet50_knn_tuned_20251218_143022.csv'
+        """
+        from datetime import datetime
+        
+        if Submission.validate(submission):
+
+            # ファイル名生成
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f"submission_{run_name}_{timestamp}.csv"
+            save_path = os.path.join(DIR_SUBMISSIONS, filename)
+            
+            # 保存
+            os.makedirs(DIR_SUBMISSIONS, exist_ok=True)
+            submission.to_csv(save_path, index=False, header=True)
+            
+            logger.info(f"提出ファイル保存: {save_path}")
+            
+    
+    @staticmethod
+    def validate(submission: pd.DataFrame) -> bool:
+        """提出ファイルのバリデーション
+        
+        Args:
+            submission: 提出用DataFrame
+            expected_length: 期待される行数（オプション）
+        
+        Returns:
+            検証結果（True: OK, False: NG）
+        """
+        sample_submission = pd.read_csv(FILE_SAMPLE_SUBMISSION)
+        
+        # カラムチェック
+        if submission.columns != sample_submission.columns:
+            print(f"❌ カラム名エラー: {submission.columns}（期待: {sample_submission.columns}）")
+            return False
+        
+        # # 長さチェック
+        # expected_length = sample_submission.shape[0]
+        # if len(submission) != expected_length:
+        #     print(f"❌ 行数エラー: {len(submission)}行（期待: {expected_length}行）")
+        #     return False
+        
+        # データ型チェック
+        if not pd.api.types.is_integer_dtype(submission['label_id']):
+            print(f"❌ データ型エラー: label_id列は整数型である必要があります")
+            return False
+        
+        
+        print(f"✅ バリデーション成功: {len(submission)}行")
+        return True
 
 
 class Logger:

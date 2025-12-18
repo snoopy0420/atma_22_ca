@@ -228,17 +228,6 @@ class Runner:
         
         return submission
 
-
-    def save_submission(self, submission: pd.DataFrame, suffix: str = ""):
-        """提出ファイル保存"""
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        filename = f"submission_{self.run_name}_{suffix}_{timestamp}.csv" if suffix else f"submission_{self.run_name}_{timestamp}.csv"
-        save_path = os.path.join(DIR_SUBMISSIONS, filename)
-        
-        submission.to_csv(save_path, index=False, header=False)
-        self.logger.info(f"提出ファイル保存: {save_path}")
-        
-        return save_path
     
     
     def load_model_cv(self, i_fold: int) -> Model:
