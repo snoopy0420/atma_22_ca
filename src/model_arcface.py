@@ -302,21 +302,26 @@ class ModelArcFace(Model):
                 ToTensorV2(),
             ])
 
-    def _create_dataloader(self, df: pd.DataFrame, train: bool = True) -> torch.utils.data.DataLoader:
+    def _create_dataloader(self, df: pd.DataFrame, split: bool = 'train') -> torch.utils.data.DataLoader:
         """DataLoaderの作成"""
+
+        # dataset
+        treatment_is_train = split in ['train', 'valid']
         dataset = BasketballDataset(
             df=df,
-            transform=self._get_transforms(train=train),
-            use_crops=False  # 訓練データは常にフル画像からクロップ
+            transform=self._get_transforms(train=treatment_is_train),
+            is_train=treatment_is_train
         )
         
+        # dataloader
+        treatment_is_train = split in ['train']
         return torch.utils.data.DataLoader(
             dataset,
             batch_size=self.batch_size,
-            shuffle=train,
+            shuffle=treatment_is_train,
             num_workers=self.num_workers,
             pin_memory=True,
-            drop_last=train,
+            drop_last=treatment_is_train,
         )
 
     def train(self, tr: pd.DataFrame, va: Optional[pd.DataFrame] = None) -> None:
@@ -361,8 +366,8 @@ class ModelArcFace(Model):
         criterion = nn.CrossEntropyLoss()
         
         # DataLoader
-        train_loader = self._create_dataloader(tr, train=True)
-        val_loader = self._create_dataloader(va, train=False) if va is not None else None
+        train_loader = self._create_dataloader(tr, split='train')
+        val_loader = self._create_dataloader(va, split='valid') if va is not None else None
         
         # 訓練ループ
         best_val_loss = float('inf')
@@ -375,8 +380,9 @@ class ModelArcFace(Model):
             
             pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{self.epochs}")
             for batch in pbar:
-                images = batch['image'].to(self.device)
-                labels = batch['label_id'].to(self.device)
+                images, labels = batch  # BasketballDatasetは(image, label)のタプルを返す
+                images = images.to(self.device)
+                labels = labels.to(self.device)
                 
                 # 順伝播
                 optimizer.zero_grad()
@@ -439,8 +445,9 @@ class ModelArcFace(Model):
         
         with torch.no_grad():
             for batch in val_loader:
-                images = batch['image'].to(self.device)
-                labels = batch['label_id'].to(self.device)
+                images, labels = batch
+                images = images.to(self.device)
+                labels = labels.to(self.device)
                 
                 outputs = self.model(images, labels)
                 loss = criterion(outputs, labels)
@@ -467,14 +474,14 @@ class ModelArcFace(Model):
             self.ema.apply_shadow(self.model)
         
         # 全データの埋め込みを抽出
-        dataloader = self._create_dataloader(df, train=False)
+        dataloader = self._create_dataloader(df, split='train')
         all_embeddings = []
         all_labels = []
         
         with torch.no_grad():
             for batch in tqdm(dataloader, desc="埋め込み抽出"):
-                images = batch['image'].to(self.device)
-                labels = batch['label_id']
+                images, labels = batch
+                images = images.to(self.device)
                 
                 embeddings = self.model.get_embedding(images)
                 all_embeddings.append(embeddings.cpu())
@@ -498,7 +505,7 @@ class ModelArcFace(Model):
         if self.use_ema:
             self.ema.restore(self.model)
 
-    def predict(self, te: pd.DataFrame) -> np.ndarray:
+    def predict(self, te: pd.DataFrame, split='test') -> np.ndarray:
         """
         予測
         
@@ -517,17 +524,22 @@ class ModelArcFace(Model):
             self.ema.apply_shadow(self.model)
         
         # テストデータの埋め込みを抽出
-        dataloader = self._create_dataloader(te, train=False)
+        dataloader = self._create_dataloader(te, split=split)
         all_embeddings = []
         
         with torch.no_grad():
             for batch in tqdm(dataloader, desc="推論中"):
-                images = batch['image'].to(self.device)
+                # trainがTrueの場合はタプル、Falseの場合は画像のみ
+                if split != 'test':
+                    images, _ = batch
+                else:
+                    images = batch
+                images = images.to(self.device)
                 embeddings = self.model.get_embedding(images)
                 all_embeddings.append(embeddings.cpu())
         
         all_embeddings = torch.cat(all_embeddings, dim=0)
-        
+                
         # プロトタイプとの類似度で予測
         similarities = F.linear(all_embeddings, self.prototypes)  # [N, num_classes]
         max_sims, max_indices = similarities.max(dim=1)
@@ -550,7 +562,9 @@ class ModelArcFace(Model):
         if self.use_ema:
             self.ema.restore(self.model)
         
-        return predictions
+        # 元のDataFrameのインデックスを保持
+        result = pd.DataFrame({'label_id': predictions}, index=te.index)
+        return result
 
     def save_model(self) -> None:
         """モデルの保存"""

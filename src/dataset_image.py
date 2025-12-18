@@ -19,18 +19,16 @@ from configs.config import *
 class BasketballDataset(Dataset):
     """バスケットボール選手識別用Dataset"""
     
-    def __init__(self, df: pd.DataFrame, transform=None, is_train=True, use_crops=False):
+    def __init__(self, df: pd.DataFrame, transform=None, is_train=True):
         """
         Args:
             df: メタデータDataFrame
             transform: データ拡張・前処理
-            is_train: 訓練データかどうか
-            use_crops: テストデータで切り抜き済み画像(crops)を使用するか
+            is_train: 訓練データかどうか（False=テストデータ）
         """
         self.df = df.reset_index(drop=True)
         self.transform = transform
         self.is_train = is_train
-        self.use_crops = use_crops
         
     def __len__(self):
         return len(self.df)
@@ -43,7 +41,7 @@ class BasketballDataset(Dataset):
         
         # 前処理・Data Augmentation
         if self.transform:
-            image = self.transform(image)
+            image = self.transform(image=image)['image']
         
         if self.is_train:
             label = row['label_id']
@@ -53,55 +51,30 @@ class BasketballDataset(Dataset):
     
     def _load_and_crop(self, row):
         """画像読み込みとbbox切り出し（最適化版）"""
-        # リスタート後: テストデータは切り抜き済み画像を使用
-        if self.use_crops and 'rel_path' in row and pd.notna(row['rel_path']):
-            # 切り抜き済み画像を直接読み込み
-            from configs.config import DIR_INPUT
+        # 学習データ: train_crops/が存在すればそこから読み込み
+        if self.is_train:
+            from pathlib import Path
+            train_crop_dir = Path(DIR_INTERIM) / 'train_crops'
+            if train_crop_dir.exists():
+                idx = row.name
+                crop_path = train_crop_dir / f"{idx}.jpg"
+                if crop_path.exists():
+                    img = cv2.imread(str(crop_path), cv2.IMREAD_COLOR)
+                    if img is not None:
+                        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                        return cv2.resize(img, (224, 224), interpolation=cv2.INTER_AREA)
+        
+        # テストデータ: crops/{rel_path}
+        if not self.is_train and 'rel_path' in row and pd.notna(row['rel_path']):
             img_path = os.path.join(DIR_INPUT, row['rel_path'])
-            
-            if not os.path.exists(img_path):
-                raise FileNotFoundError(f"⚠️ Cropped image not found: {img_path}")
-            img = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
-            if img is None:
-                raise ValueError(f"⚠️ Failed to read cropped image: {img_path}")
-            
-            # BGR→RGB変換
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            
-            # リサイズ（INTER_AREAで縮小最適化）
-            resized = cv2.resize(img, (224, 224), interpolation=cv2.INTER_AREA)
-            
-            return resized
+            if os.path.exists(img_path):
+                img = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
+                if img is not None:
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    return cv2.resize(img, (224, 224), interpolation=cv2.INTER_AREA)
         
-        # 学習データ: 元の処理（完全な画像からbbox切り出し）
-        # 画像パス
-        img_path = os.path.join(
-            DIR_IMAGE,
-            f"{row['quarter']}__{row['angle']}__{str(row['session']).zfill(2)}__{str(row['frame']).zfill(2)}.jpg"
-        )
         
-        # 読み込み（IMREAD_COLORで高速化）
-        if not os.path.exists(img_path):
-            raise FileNotFoundError(f"⚠️ Image not found: {img_path}")
-        img = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
-        if img is None:
-            raise ValueError(f"⚠️ Failed to read image: {img_path}")
-        
-        # BGR→RGB変換
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        
-        # bbox切り出し
-        x, y, w, h = int(row['x']), int(row['y']), int(row['w']), int(row['h'])
-        x1, y1 = max(0, x), max(0, y)
-        x2, y2 = min(img.shape[1], x + w), min(img.shape[0], y + h)
-        if x2 <= x1 or y2 <= y1:
-            raise ValueError(f"⚠️ Invalid bbox: x={x}, y={y}, w={w}, h={h}, img_shape={img.shape}")
-        cropped = img[y1:y2, x1:x2]
-        
-        # リサイズ（INTER_AREAで縮小最適化）
-        resized = cv2.resize(cropped, (224, 224), interpolation=cv2.INTER_AREA)
-        
-        return resized
+        raise FileNotFoundError(f"画像が見つかりません: {row}")
 
 
 class CachedFeatureDataset(Dataset):
