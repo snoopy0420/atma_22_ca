@@ -18,7 +18,7 @@ from configs.config import *
 from src.model import Model
 from src.util import Util
 from src.dataset_image import BasketballDataset, get_transforms
-from src.feature_cache import FeatureCache
+import json
 
 
 class ModelResNet50Base(Model):
@@ -41,12 +41,10 @@ class ModelResNet50Base(Model):
         self.train_labels = None
         self.test_similarities = None  # 類似度キャッシュ
         
-        # キャッシュ管理
-        self.cache_manager = FeatureCache()
-        
-        # 出力ディレクトリ
+        # 出力ディレクトリ（特徴量もここに保存）
         self.base_dir = os.path.join(out_dir_name, run_fold_name)
-        os.makedirs(self.base_dir, exist_ok=True)
+        self.features_dir = os.path.join(self.base_dir, 'features')
+        os.makedirs(self.features_dir, exist_ok=True)
         
         # モデルのロード
         self._load_feature_extractor()
@@ -74,20 +72,21 @@ class ModelResNet50Base(Model):
         raise NotImplementedError("Subclass must implement train()")
 
     # 共通実装（テンプレートメソッドパターン）
-    def predict(self, te: pd.DataFrame) -> pd.DataFrame:
+    def predict(self, te: pd.DataFrame, split: str = 'test') -> pd.DataFrame:
         """
         テストデータを予測（共通処理）
         
         Args:
             te: テストデータ
+            is_validation: 検証データかどうか（split名の決定に使用）
         
         Returns:
             予測結果DataFrame (label_id列)
         """
-        # テスト特徴抽出（キャッシュ自動管理）
-        test_features = self._extract_features_batch(te, split='test')
+        # 特徴抽出（キャッシュがあれば読み込み、なければ抽出）
+        test_features = self._get_or_extract_features(te, split=split)
         
-        self.logger.info(f"Predicting with {self.__class__.__name__}...")
+        self.logger.info(f"{self.__class__.__name__}で予測中...")
         
         # 類似度計算（子クラスで実装）
         similarities = self._compute_similarities(test_features)
@@ -100,13 +99,43 @@ class ModelResNet50Base(Model):
         
         return pd.DataFrame({'label_id': predictions})
     
+    def _get_or_extract_features(self, df: pd.DataFrame, split: str = 'train') -> np.ndarray:
+        """
+        特徴量取得（キャッシュがあれば読み込み、なければ抽出）
+        
+        Args:
+            df: メタデータ
+            split: 'train', 'valid', 'test'
+        
+        Returns:
+            特徴量配列 (N, feature_dim)
+        """
+        if not self.use_cache:
+            # キャッシュ無効の場合は毎回抽出
+            return self._extract_features_with_dataloader(df, split)
+        
+        # キャッシュパス
+        cache_path = os.path.join(self.features_dir, f"{split}_features.npy")
+        
+        # キャッシュがあれば読み込み
+        if os.path.exists(cache_path):
+            self.logger.info(f"特徴量をキャッシュから読み込み: {cache_path}")
+            return np.load(cache_path)
+        
+        # キャッシュがない場合は抽出して保存
+        features = self._extract_features_with_dataloader(df, split)
+        np.save(cache_path, features)
+        self.logger.info(f"特徴量を保存: {cache_path}")
+        
+        return features
+    
     def _extract_features_batch(self, df: pd.DataFrame, split: str = 'train') -> np.ndarray:
         """
         DataLoaderを使った効率的な特徴抽出
         
         Args:
             df: メタデータ
-            split: 'train' or 'test' (キャッシュキー生成用)
+            split: 'train', 'valid', 'test' (キャッシュキー生成用)
         
         Returns:
             特徴量配列 (N, feature_dim)
@@ -117,23 +146,27 @@ class ModelResNet50Base(Model):
             cache_key = self.cache_manager.get_cache_key(df, self.model_name, self.params, self.run_fold_name)
             
             if self.cache_manager.exists(cache_key, split):
-                self.logger.info(f"Loading features from cache ({cache_key})...")
+                self.logger.info(f"キャッシュから特徴量を読み込み ({cache_key})...")
                 features = self.cache_manager.load(cache_key, split)
                 return features
         
         # キャッシュがない場合は抽出
-        self.logger.info(f"Extracting features from {len(df)} images ({split})...")
+        self.logger.info(f"{len(df)}枚の画像から特徴抽出中 ({split})...")
         
         # Dataset & DataLoader作成
         is_train = (split == 'train')
         transform = get_transforms(is_train=False)  # Phase 1では拡張なし
         dataset = BasketballDataset(df, transform=transform, is_train=is_train)
+        
+        use_cuda = torch.cuda.is_available()
         dataloader = DataLoader(
             dataset,
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
-            pin_memory=True if torch.cuda.is_available() else False
+            pin_memory=use_cuda,  # GPUメモリへの高速転送
+            persistent_workers=True if self.num_workers > 0 else False,  # workerの再利用
+            prefetch_factor=2 if self.num_workers > 0 else None  # 事前ロード
         )
         
         # バッチごとに特徴抽出
@@ -146,7 +179,8 @@ class ModelResNet50Base(Model):
                 else:
                     batch_imgs = batch_data
                 
-                batch_imgs = batch_imgs.to(self.device)
+                # GPU転送（非ブロッキング）
+                batch_imgs = batch_imgs.to(self.device, non_blocking=True)
                 batch_features = self.feature_extractor(batch_imgs)
                 
                 # ResNet50の出力: (batch_size, 2048, 1, 1) → (batch_size, 2048)
@@ -167,11 +201,11 @@ class ModelResNet50Base(Model):
         
         features = np.vstack(features_list)
         
-        # キャッシュに保存（特徴量のみ、ラベルは元のDataFrameから取得可能）
+        # キャッシュに保存（train/valid/testで分けて保存）
         if self.use_cache:
             cache_key = self.cache_manager.get_cache_key(df, self.model_name, self.params, self.run_fold_name)
             self.cache_manager.save(cache_key, features, split)
-            self.logger.info(f"Saved features to cache ({cache_key})")
+            self.logger.info(f"特徴量をキャッシュに保存 ({cache_key}_{split})")
         
         return features
     
@@ -191,7 +225,7 @@ class ModelResNet50Base(Model):
             'train_labels': self.train_labels,
         }
         Util.dump(model_data, model_path)
-        self.logger.info(f"Model saved: {model_path}")
+        self.logger.info(f"モデル保存: {model_path}")
 
     def load_model(self) -> None:
         """モデル読み込み（子クラスでオーバーライド可能）"""
@@ -201,4 +235,4 @@ class ModelResNet50Base(Model):
         self.train_features = model_data['train_features']
         self.train_labels = model_data['train_labels']
         
-        self.logger.info(f"Loaded features: {self.train_features.shape}")
+        self.logger.info(f"特徴量読み込み完了: {self.train_features.shape}")

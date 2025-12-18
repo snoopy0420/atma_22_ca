@@ -59,7 +59,7 @@ class FeatureCache:
         Args:
             cache_key: キャッシュキー
             features: 特徴量 (N, feature_dim)
-            split: 'train' or 'test'
+            split: 'train', 'valid', 'test'
         """
         feature_path = self.cache_dir / f"{cache_key}_{split}_features.npy"
         np.save(feature_path, features)
@@ -72,7 +72,7 @@ class FeatureCache:
         
         Args:
             cache_key: キャッシュキー
-            split: 'train' or 'test'
+            split: 'train', 'valid', 'test'
         
         Returns:
             features: 特徴量 (N, feature_dim)

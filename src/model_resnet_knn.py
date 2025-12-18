@@ -63,18 +63,18 @@ class ModelResNet50KNN(ModelResNet50Base):
             tr: 訓練データ（メタデータ + label_id）
             va: 検証データ（未実装）
         """
-        self.logger.info(f"Training KNN method (k={self.k}) with {len(tr)} samples...")
+        self.logger.info(f"KNN (k={self.k}) で{len(tr)}サンプルを学習中...")
         
         # 特徴抽出（基底クラスのメソッド + キャッシュ自動管理）
         self.train_features = self._extract_features_batch(tr, split='train')
         self.train_labels = tr['label_id'].values
         
-        self.logger.info(f"Train features shape: {self.train_features.shape}")
-        self.logger.info(f"KNN will use all {len(self.train_labels)} training samples for prediction")
+        self.logger.info(f"学習特徴量サイズ: {self.train_features.shape}")
+        self.logger.info(f"KNNは{len(self.train_labels)}サンプルを予測に使用します")
         
         # Validationがあれば評価
         if va is not None:
-            self.logger.info("Validation not implemented yet")
+            self.logger.info("検証ロジックは未実装")
 
     def _compute_similarities(self, test_features: np.ndarray) -> np.ndarray:
         """
@@ -172,24 +172,30 @@ class ModelResNet50KNN(ModelResNet50Base):
         return predictions
 
     def save_model(self) -> None:
-        """モデル保存"""
+        """モデル保存（軽量版：特徴量はキャッシュから読み込む）"""
         model_path = os.path.join(self.base_dir, f'{self.run_fold_name}.pkl')
         model_data = {
-            'train_features': self.train_features,
             'train_labels': self.train_labels,
-            'k': self.k
+            'k': self.k,
+            'train_shape': self.train_features.shape,  # 確認用
         }
         Util.dump(model_data, model_path)
-        self.logger.info(f"Model saved: {model_path}")
+        self.logger.info(f"モデル保存 (軽量版): {model_path}")
 
     def load_model(self) -> None:
-        """モデル読み込み"""
+        """モデル読み込み（特徴量はキャッシュから取得）"""
         model_path = os.path.join(self.base_dir, f'{self.run_fold_name}.pkl')
         model_data = Util.load(model_path)
         
-        self.train_features = model_data['train_features']
         self.train_labels = model_data['train_labels']
         self.k = model_data.get('k', self.k)
         
-        self.logger.info(f"Loaded features: {self.train_features.shape}")
+        # 特徴量はキャッシュから読み込む
+        cache_key = self.cache_manager.get_cache_key(None, self.model_name, self.params, self.run_fold_name)
+        if self.cache_manager.exists(cache_key, 'train'):
+            self.train_features = self.cache_manager.load(cache_key, 'train')
+            self.logger.info(f"特徴量読み込み完了: {self.train_features.shape}")
+        else:
+            raise FileNotFoundError(f"キャッシュが見つかりません: {cache_key}_train_features.npy")
+        
         self.logger.info(f"KNN k={self.k}")

@@ -54,7 +54,7 @@ class Runner:
             shuffle=cv_setting.get("shuffle", True),
             random_state=cv_setting.get("random_state", 42)
         )
-        self.logger.info(f"Using {self.cv_method}")
+        self.logger.info(f"CV手法: {self.cv_method}")
         
         # データ
         self.df_train = df_train
@@ -65,14 +65,14 @@ class Runner:
         self.out_dir_name = os.path.join(DIR_MODEL, run_name)
         os.makedirs(self.out_dir_name, exist_ok=True)
         
-        self.logger.info(f"Runner initialized: {run_name}")
-        self.logger.info(f"  Train: {len(df_train)}, Test: {len(df_test)}")
-        self.logger.info(f"  CV: {self.n_splits}-fold {self.cv_method}, group_col: {self.group_col}")
+        self.logger.info(f"Runner初期化完了: {run_name}")
+        self.logger.info(f"  学習データ: {len(df_train)}, テストデータ: {len(df_test)}")
+        self.logger.info(f"  CV設定: {self.n_splits}-fold {self.cv_method}, グループ列: {self.group_col}")
         
         # グループ数の確認（リークチェック用）
         if self.group_col:
             n_groups = df_train[self.group_col].nunique()
-            self.logger.info(f"  Total groups: {n_groups}")
+            self.logger.info(f"  総グループ数: {n_groups}")
             if n_groups < self.n_splits:
                 self.logger.warning(f"  ⚠️ Warning: Only {n_groups} groups for {self.n_splits}-fold CV!")
 
@@ -114,50 +114,27 @@ class Runner:
         
         # データ分割
         tr, va = self.create_train_valid_dataset(i_fold)
-        self.logger.info(f"  Train: {len(tr):,}, Valid: {len(va):,}")
+        self.logger.info(f"  学習: {len(tr):,}, 検証: {len(va):,}")
         
         # モデル構築
         model = self.build_model(i_fold)
         
         # 学習
-        self.logger.info("Training...")
+        self.logger.info("学習開始...")
         model.train(tr, va)
-        
-        # 検証データで評価
-        self.logger.info("Predicting on validation...")
-        va_pred = model.predict(va)
-        
-        # スコア計算
-        va_score = self.metric(va[self.target_col].values, va_pred['label_id'].values)
-        self.logger.fold_result(i_fold, va_score)
         
         # モデル保存
         model.save_model()
         
-        # 予測分布を確認
-        pred_counts = va_pred['label_id'].value_counts().sort_index()
-        self.logger.info(f"  Prediction distribution:\n{pred_counts}")
-        
-        return model, va_pred, va_score
+        return model
 
 
     def train_cv(self):
         """Cross Validationでの学習"""
         self.logger.section_start(f"Starting {self.n_splits}-Fold Cross Validation")
         
-        scores = []
-        va_preds_all = []
-        
         for i_fold in range(self.n_splits):
-            model, va_pred, score = self.train_fold(i_fold)
-            scores.append(score)
-            va_preds_all.append(va_pred)
-        
-        # CV結果のサマリー
-        self.logger.cv_summary(scores)
-        
-        # 結果保存
-        self.logger.result_scores(self.run_name, scores)
+            model = self.train_fold(i_fold)
         
         # パラメータの保存
         try:
@@ -165,8 +142,6 @@ class Runner:
             Util.jump_json(self.params, path_output)
         except:
             self.logger.info("パラメータは保存しません")
-        
-        return scores
 
 
     def train_all(self):
@@ -177,7 +152,7 @@ class Runner:
         model = self.build_model(i_fold='all')
         
         # 学習
-        self.logger.info(f"Training with {len(self.df_train):,} samples...")
+        self.logger.info(f"{len(self.df_train):,}サンプルで学習中...")
         model.train(self.df_train)
         
         # モデル保存
@@ -196,18 +171,24 @@ class Runner:
         all_predictions = []
         
         for i_fold in range(self.n_splits):
-            self.logger.info(f"Predicting with fold {i_fold}...")
+            self.logger.info(f"Fold {i_fold}で予測中...")
             
             # モデル読み込み
             model = self.build_model(i_fold)
             model.load_model()
             
             # 予測
-            te_pred = model.predict(self.df_test)
+            te_pred = model.predict(self.df_test, split='test')
             all_predictions.append(te_pred['label_id'].values)
         
         # アンサンブル（多数決）
-        self.logger.info("Ensembling predictions...")
+        self.logger.info("予測結果をアンサンブル中（多数決）...")
+        # 各foldの予測長が一致しているか確認
+        pred_lengths = [len(p) for p in all_predictions]
+        self.logger.info(f"各foldの予測サンプル数: {pred_lengths}")
+        if len(set(pred_lengths)) > 1:
+            raise ValueError(f"Prediction lengths are inconsistent: {pred_lengths}")
+        
         all_predictions = np.array(all_predictions)  # (n_folds, n_samples)
         
         final_predictions = []
@@ -224,7 +205,7 @@ class Runner:
         
         # 予測分布
         pred_counts = submission['label_id'].value_counts().sort_index()
-        self.logger.info(f"Final prediction distribution:\n{pred_counts}")
+        self.logger.info(f"最終予測分布:\n{pred_counts}")
         
         return submission
 
@@ -238,12 +219,12 @@ class Runner:
         model.load_model()
         
         # 予測
-        self.logger.info(f"Predicting {len(self.df_test)} samples...")
-        submission = model.predict(self.df_test)
+        self.logger.info(f"{len(self.df_test)}サンプルを予測中...")
+        pred = model.predict(self.df_test)
         
         # 予測分布
-        pred_counts = submission['label_id'].value_counts().sort_index()
-        self.logger.info(f"Prediction distribution:\n{pred_counts}")
+        pred_counts = pred['label_id'].value_counts().sort_index()
+        self.logger.info(f"予測分布:\n{pred_counts}")
         
         return submission
 
@@ -255,7 +236,7 @@ class Runner:
         save_path = os.path.join(DIR_SUBMISSIONS, filename)
         
         submission.to_csv(save_path, index=False, header=False)
-        self.logger.info(f"Submission saved: {save_path}")
+        self.logger.info(f"提出ファイル保存: {save_path}")
         
         return save_path
     
@@ -283,7 +264,7 @@ class Runner:
 
         # fold毎の検証データの予測・評価
         for i_fold in range(self.n_splits):
-            self.logger.info(f"Evaluating fold {i_fold}...")
+            self.logger.info(f"Fold {i_fold}を評価中...")
             
             # データ分割
             _, va = self.create_train_valid_dataset(i_fold)
@@ -293,14 +274,14 @@ class Runner:
             model.load_model()
             
             # 検証データで予測
-            va_pred = model.predict(va)
+            va_pred = model.predict(va, split='valid')
             
             # スコア計算
             va_score = self.metric(va[self.target_col].values, va_pred['label_id'].values)
             scores.append(va_score)
             va_preds_all.append(va_pred)
             
-            self.logger.info(f"  Fold {i_fold} score: {va_score:.5f}")
+            self.logger.info(f"  Fold {i_fold} スコア: {va_score:.5f}")
         
         # 全foldの予測を結合してOOFスコア計算
         df_va_preds = pd.concat(va_preds_all, axis=0).reset_index(drop=True)
@@ -314,8 +295,8 @@ class Runner:
 
         # 結果サマリー
         self.logger.info("\n" + "="*80)
-        self.logger.info(f"OOF Score (Macro F1): {oof_score:.5f}")
-        self.logger.info(f"Fold Scores Mean: {np.mean(scores):.5f} ± {np.std(scores):.5f}")
+        self.logger.info(f"OOFスコア (Macro F1): {oof_score:.5f}")
+        self.logger.info(f"Foldスコア平均: {np.mean(scores):.5f} ± {np.std(scores):.5f}")
         self.logger.info("="*80)
         
         # 結果保存
@@ -324,6 +305,6 @@ class Runner:
         # OOF予測結果の保存
         path_output = os.path.join(self.out_dir_name, 'va_pred.pkl')
         Util.dump_df_pickle(df_va_preds, path_output)
-        self.logger.info(f'OOF predictions saved: {path_output}')
+        self.logger.info(f'OOF予測結果保存: {path_output}')
 
         return scores, oof_score
