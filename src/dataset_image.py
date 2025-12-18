@@ -54,28 +54,25 @@ class BasketballDataset(Dataset):
         # 画像パス
         img_path = os.path.join(
             DIR_IMAGE,
-            f"{row['quarter']}__{row['angle']}__{row['session']}__{row['frame']}.jpg"
+            f"{row['quarter']}__{row['angle']}__{str(row['session']).zfill(2)}__{str(row['frame']).zfill(2)}.jpg"
         )
         
         # 読み込み
         if not os.path.exists(img_path):
-            # ダミー画像
-            return np.zeros((224, 224, 3), dtype=np.uint8)
-        
+            raise FileNotFoundError(f"⚠️ Image not found: {img_path}")
         img = cv2.imread(str(img_path))
         if img is None:
-            return np.zeros((224, 224, 3), dtype=np.uint8)
+            raise ValueError(f"⚠️ Failed to read image: {img_path}")
         
+        # BGR→RGB変換
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         
         # bbox切り出し
         x, y, w, h = int(row['x']), int(row['y']), int(row['w']), int(row['h'])
         x1, y1 = max(0, x), max(0, y)
         x2, y2 = min(img.shape[1], x + w), min(img.shape[0], y + h)
-        
         if x2 <= x1 or y2 <= y1:
-            return np.zeros((224, 224, 3), dtype=np.uint8)
-        
+            raise ValueError(f"⚠️ Invalid bbox: x={x}, y={y}, w={w}, h={h}, img_shape={img.shape}")
         cropped = img[y1:y2, x1:x2]
         
         # リサイズ

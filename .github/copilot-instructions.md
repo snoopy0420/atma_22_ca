@@ -24,6 +24,8 @@
 - **Runnerクラス**: `src/runner.py` でCV管理・学習・予測・評価を一元管理
 - **Notebookで実行**: `notebooks/exp_*.ipynb` でパラメータ設定→Runner実行→分析
 
+詳細なコードはsample_code/自分の過去コンペ/配下を参照。
+
 ### 画像コンペ必須の技術要素
 1. **PyTorch Dataset/DataLoader**: 
    - `src/dataset_image.py` でバッチごとのデータ読み込み

@@ -14,7 +14,29 @@ from src.util import Util
 
 
 class ModelResNet50KNN(ModelResNet50Base):
-    """KNN法: 訓練データとの類似度Top-kで多数決予測"""
+    """
+    KNN法によるResNet50特徴抽出 + 類似度ベース予測モデル
+    
+    【学習フェーズ】
+    1. ResNet50で訓練画像から特徴量を抽出（2048次元）
+    2. 特徴量をL2正規化して保存
+    3. 訓練データのラベルを保持
+    ※モデルパラメータの学習は不要（特徴抽出器は事前学習済み）
+    
+    【推論フェーズ】
+    1. ResNet50でテスト画像から特徴量を抽出
+    2. 全訓練データとのコサイン類似度を計算（正規化済みなので内積で計算）
+    3. Top-k近傍のラベルで多数決
+    4. 閾値判定でunknown（-1）を予測
+       - 1位の類似度 >= threshold → Top-kで多数決
+       - 2位の類似度 >= min2_threshold → 2位のラベル
+       - それ以外 → unknown（-1）
+    
+    パラメータ:
+        k: 近傍数（デフォルト: 5）
+        threshold: 1位の閾値（デフォルト: 0.5）
+        min2_threshold: 2位の閾値（デフォルト: 0.3）
+    """
 
     def __init__(self, run_fold_name: str, params: dict, out_dir_name: str, logger) -> None:
         # KNN法固有のパラメータ
@@ -27,10 +49,18 @@ class ModelResNet50KNN(ModelResNet50Base):
 
     def train(self, tr: pd.DataFrame, va: Optional[pd.DataFrame] = None) -> None:
         """
-        学習データから特徴抽出のみ（KNNは訓練データをそのまま使用）
+        【学習フェーズ】訓練データから特徴量を抽出して保持
+        
+        処理内容:
+        1. ResNet50（事前学習済み）で訓練画像から特徴量抽出
+        2. 特徴量をL2正規化（コサイン類似度計算のため）
+        3. 特徴量とラベルをメモリに保持
+        4. キャッシュに保存（2回目以降は高速化）
+        
+        ※KNN法では追加の学習は不要（訓練データをそのまま使用）
         
         Args:
-            tr: 訓練データ
+            tr: 訓練データ（メタデータ + label_id）
             va: 検証データ（未実装）
         """
         self.logger.info(f"Training KNN method (k={self.k}) with {len(tr)} samples...")
@@ -48,7 +78,12 @@ class ModelResNet50KNN(ModelResNet50Base):
 
     def _compute_similarities(self, test_features: np.ndarray) -> np.ndarray:
         """
-        全訓練データとの類似度を計算
+        【推論フェーズ Step 1】全訓練データとの類似度を計算
+        
+        処理内容:
+        - コサイン類似度 = test_features @ train_features.T
+        - 特徴量はL2正規化済みなので、内積がそのままコサイン類似度
+        - 類似度は -1.0 ~ 1.0 の範囲（1.0に近いほど類似）
         
         Args:
             test_features: テスト特徴量 (N, feature_dim)
@@ -63,7 +98,14 @@ class ModelResNet50KNN(ModelResNet50Base):
 
     def _predict_from_similarities(self, similarities: np.ndarray) -> np.ndarray:
         """
-        類似度から予測（Top-k多数決 + 閾値）
+        【推論フェーズ Step 2】類似度から予測（Top-k多数決 + 閾値判定）
+        
+        処理内容:
+        1. 各テストサンプルについて、類似度が高いTop-k個の訓練サンプルを取得
+        2. 閾値による判定:
+           - 1位の類似度 >= threshold → Top-kで多数決
+           - 2位の類似度 >= min2_threshold → 2位のラベル
+           - それ以外 → unknown（-1）
         
         Args:
             similarities: 類似度行列 (N, n_train_samples)

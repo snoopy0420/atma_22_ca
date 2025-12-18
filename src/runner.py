@@ -159,6 +159,13 @@ class Runner:
         # 結果保存
         self.logger.result_scores(self.run_name, scores)
         
+        # パラメータの保存
+        try:
+            path_output = os.path.join(self.out_dir_name, f'params.yaml')
+            Util.jump_json(self.params, path_output)
+        except:
+            self.logger.info("パラメータは保存しません")
+        
         return scores
 
 
@@ -258,3 +265,65 @@ class Runner:
         model = self.build_model(i_fold)
         model.load_model()
         return model
+
+
+    def metric_cv(self):
+        """CVでの評価を行う（OOF評価）
+        
+        学習済みの各foldモデルで検証データを予測し、全体のOOFスコアを算出
+        
+        Returns:
+            scores: 各foldのスコアリスト
+            oof_score: OOF全体のスコア
+        """
+        self.logger.section_start(f"Evaluating {self.n_splits}-Fold CV (OOF)")
+
+        scores = []
+        va_preds_all = []
+
+        # fold毎の検証データの予測・評価
+        for i_fold in range(self.n_splits):
+            self.logger.info(f"Evaluating fold {i_fold}...")
+            
+            # データ分割
+            _, va = self.create_train_valid_dataset(i_fold)
+            
+            # 学習済みモデル読み込み
+            model = self.build_model(i_fold)
+            model.load_model()
+            
+            # 検証データで予測
+            va_pred = model.predict(va)
+            
+            # スコア計算
+            va_score = self.metric(va[self.target_col].values, va_pred['label_id'].values)
+            scores.append(va_score)
+            va_preds_all.append(va_pred)
+            
+            self.logger.info(f"  Fold {i_fold} score: {va_score:.5f}")
+        
+        # 全foldの予測を結合してOOFスコア計算
+        df_va_preds = pd.concat(va_preds_all, axis=0).reset_index(drop=True)
+        
+        # 訓練データと結合して正解ラベルと比較
+        # インデックスが維持されているので直接比較可能
+        oof_score = self.metric(
+            self.df_train['label_id'].values,
+            df_va_preds['label_id'].values
+        )
+
+        # 結果サマリー
+        self.logger.info("\n" + "="*80)
+        self.logger.info(f"OOF Score (Macro F1): {oof_score:.5f}")
+        self.logger.info(f"Fold Scores Mean: {np.mean(scores):.5f} ± {np.std(scores):.5f}")
+        self.logger.info("="*80)
+        
+        # 結果保存
+        self.logger.result_scores(self.run_name, scores)
+        
+        # OOF予測結果の保存
+        path_output = os.path.join(self.out_dir_name, 'va_pred.pkl')
+        Util.dump_df_pickle(df_va_preds, path_output)
+        self.logger.info(f'OOF predictions saved: {path_output}')
+
+        return scores, oof_score

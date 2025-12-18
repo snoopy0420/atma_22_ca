@@ -67,6 +67,39 @@ class ModelResNet50Base(Model):
         self.feature_extractor.to(self.device)
         self.feature_extractor.eval()
 
+
+    # 抽象メソッド（子クラスで実装必須）
+    def train(self, tr: pd.DataFrame, va: Optional[pd.DataFrame] = None) -> None:
+        """学習処理（子クラスで実装）"""
+        raise NotImplementedError("Subclass must implement train()")
+
+    # 共通実装（テンプレートメソッドパターン）
+    def predict(self, te: pd.DataFrame) -> pd.DataFrame:
+        """
+        テストデータを予測（共通処理）
+        
+        Args:
+            te: テストデータ
+        
+        Returns:
+            予測結果DataFrame (label_id列)
+        """
+        # テスト特徴抽出（キャッシュ自動管理）
+        test_features = self._extract_features_batch(te, split='test')
+        
+        self.logger.info(f"Predicting with {self.__class__.__name__}...")
+        
+        # 類似度計算（子クラスで実装）
+        similarities = self._compute_similarities(test_features)
+        
+        # 閾値適用して予測（子クラスで実装）
+        predictions = self._predict_from_similarities(similarities)
+        
+        # 類似度を保存（閾値チューニング用）
+        self.test_similarities = similarities
+        
+        return pd.DataFrame({'label_id': predictions})
+    
     def _extract_features_batch(self, df: pd.DataFrame, split: str = 'train') -> np.ndarray:
         """
         DataLoaderを使った効率的な特徴抽出
@@ -80,11 +113,12 @@ class ModelResNet50Base(Model):
         """
         # キャッシュチェック
         if self.use_cache:
-            cache_key = self.cache_manager.get_cache_key(df, self.model_name, self.params)
+            # run_fold_nameを使ってキャッシュキーを生成（run/foldごとに独立したキャッシュ）
+            cache_key = self.cache_manager.get_cache_key(df, self.model_name, self.params, self.run_fold_name)
             
             if self.cache_manager.exists(cache_key, split):
                 self.logger.info(f"Loading features from cache ({cache_key})...")
-                features, labels = self.cache_manager.load(cache_key, split)
+                features = self.cache_manager.load(cache_key, split)
                 return features
         
         # キャッシュがない場合は抽出
@@ -114,10 +148,18 @@ class ModelResNet50Base(Model):
                 
                 batch_imgs = batch_imgs.to(self.device)
                 batch_features = self.feature_extractor(batch_imgs)
-                batch_features = batch_features.squeeze()
                 
-                # 正規化
+                # ResNet50の出力: (batch_size, 2048, 1, 1) → (batch_size, 2048)
+                # flatten(1)でバッチ次元以外をフラット化
+                batch_features = batch_features.flatten(1)
+                
+                # L2正規化（コサイン類似度計算のため）
                 batch_features = batch_features.cpu().numpy()
+                
+                # バッチサイズが1の場合でも正しく動作するように確認
+                if batch_features.ndim == 1:
+                    batch_features = batch_features.reshape(1, -1)
+                
                 norms = np.linalg.norm(batch_features, axis=1, keepdims=True) + 1e-8
                 batch_features = batch_features / norms
                 
@@ -125,20 +167,14 @@ class ModelResNet50Base(Model):
         
         features = np.vstack(features_list)
         
-        # キャッシュに保存
+        # キャッシュに保存（特徴量のみ、ラベルは元のDataFrameから取得可能）
         if self.use_cache:
-            labels = df['label_id'].values if 'label_id' in df.columns else None
-            self.cache_manager.save(cache_key, features, labels, split,
-                                   {'model': self.model_name, 'params': self.params})
-            self.logger.info(f"Saved features to cache ({split})")
+            cache_key = self.cache_manager.get_cache_key(df, self.model_name, self.params, self.run_fold_name)
+            self.cache_manager.save(cache_key, features, split)
+            self.logger.info(f"Saved features to cache ({cache_key})")
         
         return features
-
-    # 抽象メソッド（子クラスで実装必須）
-    def train(self, tr: pd.DataFrame, va: Optional[pd.DataFrame] = None) -> None:
-        """学習処理（子クラスで実装）"""
-        raise NotImplementedError("Subclass must implement train()")
-
+    
     def _compute_similarities(self, test_features: np.ndarray) -> np.ndarray:
         """類似度計算（子クラスで実装）"""
         raise NotImplementedError("Subclass must implement _compute_similarities()")
@@ -146,33 +182,6 @@ class ModelResNet50Base(Model):
     def _predict_from_similarities(self, similarities: np.ndarray) -> np.ndarray:
         """類似度から予測（子クラスで実装）"""
         raise NotImplementedError("Subclass must implement _predict_from_similarities()")
-
-    # 共通実装（テンプレートメソッドパターン）
-    def predict(self, te: pd.DataFrame) -> pd.DataFrame:
-        """
-        テストデータを予測（共通処理）
-        
-        Args:
-            te: テストデータ
-        
-        Returns:
-            予測結果DataFrame (label_id列)
-        """
-        # テスト特徴抽出（キャッシュ自動管理）
-        test_features = self._extract_features_batch(te, split='test')
-        
-        self.logger.info(f"Predicting with {self.__class__.__name__}...")
-        
-        # 類似度計算（子クラスで実装）
-        similarities = self._compute_similarities(test_features)
-        
-        # 閾値適用して予測（子クラスで実装）
-        predictions = self._predict_from_similarities(similarities)
-        
-        # 類似度を保存（閾値チューニング用）
-        self.test_similarities = similarities
-        
-        return pd.DataFrame({'label_id': predictions})
 
     def save_model(self) -> None:
         """モデル保存（子クラスでオーバーライド可能）"""
