@@ -201,20 +201,8 @@ class ModelResNet50Base(Model):
 
     def save_model(self) -> None:
         """モデル保存（子クラスでオーバーライド可能）"""
-        model_path = os.path.join(self.base_dir, f'{self.run_fold_name}.pkl')
-        model_data = {
-            'train_features': self.train_features,
-            'train_labels': self.train_labels,
-        }
-        Util.dump(model_data, model_path)
-        self.logger.info(f"モデル保存: {model_path}")
+        raise NotImplementedError("Subclass must implement save_model()")
 
     def load_model(self) -> None:
         """モデル読み込み（子クラスでオーバーライド可能）"""
-        model_path = os.path.join(self.base_dir, f'{self.run_fold_name}.pkl')
-        model_data = Util.load(model_path)
-        
-        self.train_features = model_data['train_features']
-        self.train_labels = model_data['train_labels']
-        
-        self.logger.info(f"特徴量読み込み完了: {self.train_features.shape}")
+        raise NotImplementedError("Subclass must implement load_model()")
