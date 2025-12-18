@@ -129,28 +129,17 @@ class ModelResNet50Base(Model):
         
         return features
     
-    def _extract_features_batch(self, df: pd.DataFrame, split: str = 'train') -> np.ndarray:
+    def _extract_features_with_dataloader(self, df: pd.DataFrame, split: str = 'train') -> np.ndarray:
         """
-        DataLoaderを使った効率的な特徴抽出
+        DataLoaderを使った効率的な特徴抽出（純粋な抽出処理）
         
         Args:
             df: メタデータ
-            split: 'train', 'valid', 'test' (キャッシュキー生成用)
+            split: 'train', 'valid', 'test'
         
         Returns:
             特徴量配列 (N, feature_dim)
         """
-        # キャッシュチェック
-        if self.use_cache:
-            # run_fold_nameを使ってキャッシュキーを生成（run/foldごとに独立したキャッシュ）
-            cache_key = self.cache_manager.get_cache_key(df, self.model_name, self.params, self.run_fold_name)
-            
-            if self.cache_manager.exists(cache_key, split):
-                self.logger.info(f"キャッシュから特徴量を読み込み ({cache_key})...")
-                features = self.cache_manager.load(cache_key, split)
-                return features
-        
-        # キャッシュがない場合は抽出
         self.logger.info(f"{len(df)}枚の画像から特徴抽出中 ({split})...")
         
         # Dataset & DataLoader作成
@@ -166,7 +155,7 @@ class ModelResNet50Base(Model):
             num_workers=self.num_workers,
             pin_memory=use_cuda,  # GPUメモリへの高速転送
             persistent_workers=True if self.num_workers > 0 else False,  # workerの再利用
-            prefetch_factor=2 if self.num_workers > 0 else None  # 事前ロード
+            prefetch_factor=4 if self.num_workers > 0 else None  # 事前ロード（2→4に増加）
         )
         
         # バッチごとに特徴抽出
@@ -200,13 +189,6 @@ class ModelResNet50Base(Model):
                 features_list.append(batch_features)
         
         features = np.vstack(features_list)
-        
-        # キャッシュに保存（train/valid/testで分けて保存）
-        if self.use_cache:
-            cache_key = self.cache_manager.get_cache_key(df, self.model_name, self.params, self.run_fold_name)
-            self.cache_manager.save(cache_key, features, split)
-            self.logger.info(f"特徴量をキャッシュに保存 ({cache_key}_{split})")
-        
         return features
     
     def _compute_similarities(self, test_features: np.ndarray) -> np.ndarray:

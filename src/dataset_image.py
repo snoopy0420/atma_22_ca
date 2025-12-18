@@ -50,17 +50,17 @@ class BasketballDataset(Dataset):
             return image
     
     def _load_and_crop(self, row):
-        """画像読み込みとbbox切り出し"""
+        """画像読み込みとbbox切り出し（最適化版）"""
         # 画像パス
         img_path = os.path.join(
             DIR_IMAGE,
             f"{row['quarter']}__{row['angle']}__{str(row['session']).zfill(2)}__{str(row['frame']).zfill(2)}.jpg"
         )
         
-        # 読み込み
+        # 読み込み（IMREAD_COLORで高速化）
         if not os.path.exists(img_path):
             raise FileNotFoundError(f"⚠️ Image not found: {img_path}")
-        img = cv2.imread(str(img_path))
+        img = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
         if img is None:
             raise ValueError(f"⚠️ Failed to read image: {img_path}")
         
@@ -75,8 +75,8 @@ class BasketballDataset(Dataset):
             raise ValueError(f"⚠️ Invalid bbox: x={x}, y={y}, w={w}, h={h}, img_shape={img.shape}")
         cropped = img[y1:y2, x1:x2]
         
-        # リサイズ
-        resized = cv2.resize(cropped, (224, 224))
+        # リサイズ（INTER_AREAで縮小最適化）
+        resized = cv2.resize(cropped, (224, 224), interpolation=cv2.INTER_AREA)
         
         return resized
 
