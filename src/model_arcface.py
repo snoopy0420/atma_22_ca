@@ -395,8 +395,12 @@ class PlayerEmbeddingModel(nn.Module):
             訓練時: ArcFaceのlogits [B, num_classes]
             推論時: 正規化埋め込み [B, embedding_dim]
         """
-        features = self.backbone(x)  # Backbone特徴抽出
-        embedding = self.embedding(features)  # 埋め込み射影
+        # Backbone特徴抽出
+        features = self.backbone(x) 
+
+        # Embedding Layer: 特徴を低次元埋め込み空間に射影
+        embedding = self.embedding(features)  
+
         if labels is not None:
             # 訓練時: ArcFace損失用のlogits
             return self.arcface(embedding, labels)
@@ -603,56 +607,36 @@ class ModelArcFace(Model):
     - 損失: ArcFace（角度マージンによる識別性向上）
     - 正則化: BatchNorm + Dropout + EMA
     - 最適化: AdamW + Cosine Annealing LR
-    
-    ハイパーパラメータ:
-    - arcface_s: 30.0（スケール）
-    - arcface_m: 0.5（角度マージン、約28.6度）
-    - threshold: 0.5（unknown判定閾値）
-    - ema_decay: 0.9998（移動平均の減衰率）
     """
 
     def __init__(self, run_fold_name: str, params: dict, out_dir_name: str, logger) -> None:
         """
         ArcFaceモデルの初期化
-        
-        Args:
-            run_fold_name: 実行名（例: "arcface_efficientnet_b0_202512190149_fold-0"）
-            params: ハイパーパラメータ辞書
-            out_dir_name: モデル保存先ディレクトリ（例: "models/"）
-            logger: ロギングオブジェクト
         """
         super().__init__(run_fold_name, params, out_dir_name, logger)
-        
         # モデルアーキテクチャ設定
         self.model_name = params.get('model_name', 'efficientnet_b0')  # Backboneモデル
         self.embedding_dim = params.get('embedding_dim', 512)  # 埋め込み次元
         self.img_size = params.get('img_size', 224)  # 入力画像サイズ
-        
         # 訓練設定
         self.batch_size = params.get('batch_size', 64)
         self.epochs = params.get('epochs', 20)
         self.lr = params.get('lr', 1e-3)  # 学習率
         self.weight_decay = params.get('weight_decay', 1e-4)  # L2正則化
-        
         # ArcFace損失パラメータ
         self.arcface_s = params.get('arcface_s', 30.0)  # スケール（logitの増幅）
         self.arcface_m = params.get('arcface_m', 0.5)  # 角度マージン（rad）
-        
         # EMA（指数移動平均）設定
         self.use_ema = params.get('use_ema', True)
         self.ema_decay = params.get('ema_decay', 0.995)  # 減衰率（RedBull推奨値: 短期訓練に適切）
-        
         # 推論設定
         self.threshold = params.get('threshold', 0.5)  # cos類似度閾値（unknown判定用）
         self.num_workers = params.get('num_workers', 8)  # DataLoaderワーカー数（GPU待ち時間を削減）
-        
         # デバイス設定
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
         # モデル保存ディレクトリ
         self.model_dir = os.path.join(out_dir_name, run_fold_name)
         os.makedirs(self.model_dir, exist_ok=True)
-        
         # 訓練/推論時に使用する変数（初期化時はNone）
         self.pl_module = None  # PyTorch Lightningモジュール
         self.prototypes = None  # 各クラスの代表埋め込み [num_classes, embedding_dim]
@@ -676,7 +660,7 @@ class ModelArcFace(Model):
             tr: 訓練データフレーム（画像パス、label_idを含む）
             va: 検証データフレーム（オプション）
         """
-        # 訓練設定をログ出力
+        # 訓練設定ログ
         self.logger.info(f"ArcFace訓練開始: {len(tr)}サンプル")
         self.logger.info(f"  モデル: {self.model_name}, 次元: {self.embedding_dim}")
         self.logger.info(f"  バッチ: {self.batch_size}, エポック: {self.epochs}")
@@ -685,7 +669,7 @@ class ModelArcFace(Model):
         self.num_classes = tr['label_id'].nunique()
         self.logger.info(f"  クラス数: {self.num_classes}")
         
-        # PLモジュールを初期化
+        # PLモジュール
         self.pl_module = PlayerModule(
             model_name=self.model_name, 
             num_classes=self.num_classes, 
@@ -706,26 +690,26 @@ class ModelArcFace(Model):
                 dirpath=self.model_dir, 
                 filename='best',
                 monitor='val_f1',
-                mode='max',  # 最小値を保存
+                mode='max',  # 最大値を保存
                 save_top_k=1,  # ベスト1つのみ保存
                 verbose=True,
                 enable_version_counter=False,
             )
         ]
         
-        # Trainer初期化
+        # Trainer
         trainer = pl.Trainer(
             max_epochs=self.epochs,
             accelerator='gpu' if torch.cuda.is_available() else 'cpu',
             devices=1,  # GPU 1台使用（autoだとマルチGPU設定で遅延の可能性）
             callbacks=callbacks,
             enable_progress_bar=False,  # プログレスバー表示
-            enable_model_summary=True,  # モデル概要表示
+            enable_model_summary=False,  # モデル概要表示
             logger=False,  # ロガー設定
             precision="16-mixed",  # 混合精度で高速化
         )
 
-        # DataLoader作成
+        # DataLoader
         train_loader = _create_dataloader(tr, 'train', self.batch_size, self.num_workers, self.img_size)
         val_loader = _create_dataloader(va, 'valid', self.batch_size, self.num_workers, self.img_size) if va is not None else None
         
@@ -748,7 +732,6 @@ class ModelArcFace(Model):
             self.logger.info(f"ベストモデルをロード: {best_model_path}")
         
         # プロトタイプ計算（各クラスの代表埋め込み）
-        # 推論時にcos類似度比較で分類するために使用
         self.logger.info("プロトタイプ計算中...")
         self.prototypes = compute_prototypes(
             self.pl_module, 
@@ -758,6 +741,7 @@ class ModelArcFace(Model):
         )
         # プロトタイプを保存（推論時にロード）
         torch.save(self.prototypes, os.path.join(self.model_dir, 'prototypes.pth'))
+
         self.logger.info("訓練完了")
 
     def predict(self, te: pd.DataFrame, split='test') -> pd.DataFrame:
@@ -775,27 +759,23 @@ class ModelArcFace(Model):
         - similarities[i, j] = cos(embedding_i, prototype_j)
         - 最大類似度が閾値以上 → そのクラスと予測
         - 最大類似度が閾値未満 → unknown (-1) と予測
-        
-        Args:
-            te: テストデータフレーム
-            split: 'test'または'valid'（検証データの予測時）
-        
-        Returns:
-            予測結果DataFrame（label_id列）
         """
         self.logger.info(f"ArcFace予測: {len(te)}サンプル")
+        
+        # 元のインデックスを保存（OOF評価で正しい対応付けに必要）
+        original_index = te.index.copy()
         
         # 評価モード（Dropout無効化、BatchNorm固定）
         self.pl_module.eval()
         
-        # DataLoader作成（RedBullのTestDatasetを使用）
+        # DataLoader
         dataloader = _create_dataloader(te, split, self.batch_size, self.num_workers, self.img_size)
         all_embeddings = []
         
         # 全データの埋め込みを抽出（勾配計算不要）
         with torch.no_grad():
             for batch in tqdm(dataloader, desc="推論中"):
-                # バッチから画像を取得
+
                 images = batch['image'].to(self.device, non_blocking=True)  # 非同期転送
                 
                 # 埋め込み抽出（EMAモデルで安定した特徴量を取得）
@@ -818,13 +798,8 @@ class ModelArcFace(Model):
         for sim, idx in zip(max_sims.tolist(), max_indices.tolist()):
             predictions.append(-1 if sim < self.threshold else idx)
         
-        # 予測分布をログ出力（デバッグ・分析用）
-        predictions = np.array(predictions)
-        unique, counts = np.unique(predictions, return_counts=True)
-        self.logger.info(f"予測分布: {dict(zip(unique, counts))}")
-        
-        # DataFrameで返す（Runnerの仕様に合わせる）
-        return pd.DataFrame({'label_id': predictions}, index=te.index)
+        # DataFrameで返す（元のインデックスを使用してRunnerでの評価を正確に）
+        return pd.DataFrame({'label_id': predictions}, index=original_index)
 
     def save_model(self) -> None:
         """

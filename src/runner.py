@@ -42,19 +42,17 @@ class Runner:
         self.params = params
         self.logger = logger
         
-        # CV設定
-        self.group_col = cv_setting.get("group_col")
-        self.n_splits = cv_setting.get("n_splits", 5)
-        self.cv_method = cv_setting.get("method", "group")  # "group" or "stratified_group"
+        # CV設定（validatorは必須）
+        if 'validator' not in cv_setting:
+            raise ValueError("cv_setting に 'validator' が必要です。Validation.create_validator()で作成してください。")
         
-        # Validation を使用してvalidator作成
-        self.validator = Validation.create_validator(
-            method=self.cv_method,
-            n_splits=self.n_splits,
-            shuffle=cv_setting.get("shuffle", True),
-            random_state=cv_setting.get("random_state", 42)
-        )
-        self.logger.info(f"CV手法: {self.cv_method}")
+        self.validator = cv_setting['validator']
+        self.group_col = cv_setting.get("group_col")
+        self.n_splits = getattr(self.validator, 'n_splits', getattr(self.validator, 'get_n_splits', lambda: 5)())
+        
+        # validator情報をログ出力
+        validator_name = type(self.validator).__name__
+        self.logger.info(f"CV手法: {validator_name} ({self.n_splits}-fold)")
         
         # データ
         self.df_train = df_train
@@ -67,7 +65,7 @@ class Runner:
         
         self.logger.info(f"Runner初期化完了: {run_name}")
         self.logger.info(f"  学習データ: {len(df_train)}, テストデータ: {len(df_test)}")
-        self.logger.info(f"  CV設定: {self.n_splits}-fold {self.cv_method}, グループ列: {self.group_col}")
+        self.logger.info(f"  グループ列: {self.group_col if self.group_col else 'なし'}")
         
         # グループ数の確認（リークチェック用）
         if self.group_col:
@@ -96,7 +94,12 @@ class Runner:
 
     def create_train_valid_dataset(self, i_fold: int):
         """訓練・検証データの分割"""
-        groups = self.df_train[self.group_col].values
+        # group_colがある場合のみgroupsを使用
+        if self.group_col and self.group_col in self.df_train.columns:
+            groups = self.df_train[self.group_col].values
+        else:
+            groups = None
+        
         y = self.df_train[self.target_col].values
         
         splits = list(self.validator.split(self.df_train, y, groups))
@@ -262,7 +265,7 @@ class Runner:
             model = self.build_model(i_fold)
             model.load_model()
             
-            # 検証データで予測
+            # 検証データで予測（元のインデックスを保持）
             va_pred = model.predict(va, split='valid')
             
             # スコア計算
@@ -273,12 +276,19 @@ class Runner:
             self.logger.info(f"  Fold {i_fold} スコア: {va_score:.5f}")
         
         # 全foldの予測を結合してOOFスコア計算
-        df_va_preds = pd.concat(va_preds_all, axis=0).reset_index(drop=True)
+        df_va_preds = pd.concat(va_preds_all, axis=0)
         
-        # 訓練データと結合して正解ラベルと比較
-        # インデックスが維持されているので直接比較可能
+        # インデックスでソートして元の順序に並べる
+        df_va_preds = df_va_preds.sort_index()
+        
+        # 訓練データと同じ順序でOOFスコア計算
+        # インデックスが一致することを確認
+        if not df_va_preds.index.equals(self.df_train.index):
+            self.logger.info("⚠️ Warning: OOF予測のインデックスが訓練データと一致しません！")
+            self.logger.info(f"  訓練データ: {len(self.df_train)}行, OOF予測: {len(df_va_preds)}行")
+        
         oof_score = self.metric(
-            self.df_train['label_id'].values,
+            self.df_train.loc[df_va_preds.index, 'label_id'].values,
             df_va_preds['label_id'].values
         )
 

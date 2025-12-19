@@ -267,6 +267,56 @@ class Metric:
     def my_metric(cls, y_true, y_pred):
         """コンペ用の評価指標（Macro F1）"""
         return cls.macro_f1(y_true, y_pred)
+    
+    @classmethod
+    def unknown_metrics(cls, y_true: np.ndarray, y_pred: np.ndarray, 
+                       unknown_player_id: int) -> dict:
+        """Unknown判定の評価指標を計算
+        
+        Args:
+            y_true: 正解ラベル
+            y_pred: 予測ラベル
+            unknown_player_id: unknown判定すべき選手ID
+        
+        Returns:
+            dict: 評価指標の辞書
+                - unknown_precision: Unknown判定の精度
+                - unknown_recall: Unknown判定の再現率
+                - unknown_f1: Unknown判定のF1
+                - known_macro_f1: 既知選手のMacro F1
+                - unknown_samples: unknown選手のサンプル数
+                - unknown_detected: unknownと予測したサンプル数
+        """
+        # unknown選手のマスク
+        is_unknown = (y_true == unknown_player_id)
+        
+        # 予測がunknown (-1) かどうか
+        pred_unknown = (y_pred == -1)
+        
+        # Unknown判定の評価
+        tp = np.sum(is_unknown & pred_unknown)
+        fp = np.sum(~is_unknown & pred_unknown)
+        fn = np.sum(is_unknown & ~pred_unknown)
+        
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+        
+        # 既知選手のMacro F1
+        known_mask = ~is_unknown
+        known_macro_f1 = cls.macro_f1(y_true[known_mask], y_pred[known_mask]) if known_mask.sum() > 0 else 0.0
+        
+        return {
+            'unknown_precision': float(precision),
+            'unknown_recall': float(recall),
+            'unknown_f1': float(f1),
+            'known_macro_f1': float(known_macro_f1),
+            'unknown_samples': int(is_unknown.sum()),
+            'unknown_detected': int(pred_unknown.sum()),
+            'tp': int(tp),
+            'fp': int(fp),
+            'fn': int(fn)
+        }
 
 
 class Validation:
@@ -313,125 +363,6 @@ class Validation:
     
     
     @staticmethod
-    def check_group_leak(validator, X: pd.DataFrame, y: np.ndarray, 
-                        groups: np.ndarray, verbose: bool = True) -> Dict[str, Any]:
-        """
-        グループ間のリークをチェック
-        
-        Args:
-            validator: sklearn cross-validator
-            X: 特徴量データフレーム
-            y: ターゲット配列
-            groups: グループ配列
-            verbose: 詳細出力の有無
-        
-        Returns:
-            Dict containing:
-                - has_leak: bool (リークの有無)
-                - fold_results: List[Dict] (各Foldの結果)
-        """
-        fold_results = []
-        has_leak = False
-        
-        if verbose:
-            print("="*80)
-            print("🔍 CV Group Leak Check")
-            print("="*80)
-        
-        for fold_idx, (train_idx, valid_idx) in enumerate(validator.split(X, y, groups)):
-            train_groups = set(groups[train_idx])
-            valid_groups = set(groups[valid_idx])
-            
-            # 重複チェック
-            overlap = train_groups & valid_groups
-            fold_has_leak = len(overlap) > 0
-            has_leak = has_leak or fold_has_leak
-            
-            leak_status = "❌ LEAK!" if fold_has_leak else "✅ No leak"
-            
-            # 選手分布
-            train_labels = set(y[train_idx])
-            valid_labels = set(y[valid_idx])
-            
-            # 各選手のサンプル数
-            train_label_counts = pd.Series(y[train_idx]).value_counts()
-            valid_label_counts = pd.Series(y[valid_idx]).value_counts()
-            
-            fold_result = {
-                'fold': fold_idx,
-                'train_samples': len(train_idx),
-                'valid_samples': len(valid_idx),
-                'train_groups': len(train_groups),
-                'valid_groups': len(valid_groups),
-                'overlap_groups': len(overlap),
-                'has_leak': fold_has_leak,
-                'train_labels': len(train_labels),
-                'valid_labels': len(valid_labels),
-                'overlap_labels': len(train_labels & valid_labels),
-                'train_label_min': train_label_counts.min(),
-                'train_label_max': train_label_counts.max(),
-                'valid_label_min': valid_label_counts.min(),
-                'valid_label_max': valid_label_counts.max(),
-            }
-            fold_results.append(fold_result)
-            
-            if verbose:
-                print(f"\nFold {fold_idx}: {leak_status}")
-                print(f"  Train: {len(train_idx):5,} samples, {len(train_groups):3d} groups")
-                print(f"  Valid: {len(valid_idx):5,} samples, {len(valid_groups):3d} groups")
-                print(f"  Overlap groups: {len(overlap)}")
-                print(f"  Players - Train: {len(train_labels)}, Valid: {len(valid_labels)}, Overlap: {len(train_labels & valid_labels)}")
-                print(f"  Label balance (train): min={train_label_counts.min()}, max={train_label_counts.max()}")
-                print(f"  Label balance (valid): min={valid_label_counts.min()}, max={valid_label_counts.max()}")
-        
-        if verbose:
-            print("\n" + "="*80)
-            if has_leak:
-                print("❌ LEAK DETECTED!")
-            else:
-                print("✅ No Leakage - CV Strategy is Valid")
-            print("="*80)
-        
-        return {
-            'has_leak': has_leak,
-            'fold_results': fold_results
-        }
-    
-    
-    @staticmethod
-    def get_cv_statistics(validator, X: pd.DataFrame, y: np.ndarray, 
-                         groups: np.ndarray) -> pd.DataFrame:
-        """
-        CV分割の統計情報をDataFrameとして取得
-        
-        Args:
-            validator: sklearn cross-validator
-            X: 特徴量データフレーム
-            y: ターゲット配列
-            groups: グループ配列
-        
-        Returns:
-            pd.DataFrame: 各Foldの統計情報
-        """
-        fold_stats = []
-        
-        for fold_idx, (train_idx, valid_idx) in enumerate(validator.split(X, y, groups)):
-            train_groups = set(groups[train_idx])
-            valid_groups = set(groups[valid_idx])
-            
-            fold_stats.append({
-                'fold': fold_idx,
-                'train_samples': len(train_idx),
-                'valid_samples': len(valid_idx),
-                'train_groups': len(train_groups),
-                'valid_groups': len(valid_groups),
-                'overlap_groups': len(train_groups & valid_groups),
-            })
-        
-        return pd.DataFrame(fold_stats)
-    
-    
-    @staticmethod
     def split_by_index(df: pd.DataFrame, train_idx: np.ndarray, 
                       valid_idx: np.ndarray) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
@@ -449,41 +380,52 @@ class Validation:
         valid_df = df.iloc[valid_idx].reset_index(drop=True)
         return train_df, valid_df
     
+
+class Q1Q2Validator:
+    """Q1/Q2クォーター分割用のValidator
     
-    @staticmethod
-    def log_fold_result(fold_idx: int, train_size: int, valid_size: int, 
-                       score: float, metric_name: str = "Macro F1"):
+    Unknown判定評価用のカスタムCV戦略
+    - Fold 0: Q2で訓練 → Q1で検証（選手0がunknown）
+    - Fold 1: Q1で訓練 → Q2で検証（選手5がunknown）
+    """
+    
+    def __init__(self, quarter_col: str = 'quarter'):
         """
-        Fold結果のログ出力
+        Args:
+            quarter_col: クォーター列名
+        """
+        self.quarter_col = quarter_col
+        self.n_splits = 2
+    
+    def split(self, X, y=None, groups=None):
+        """CV分割を生成
         
         Args:
-            fold_idx: Fold番号
-            train_size: 訓練データサイズ
-            valid_size: 検証データサイズ
-            score: スコア
-            metric_name: メトリクス名
-        """
-        print(f"\n{'='*60}")
-        print(f"Fold {fold_idx} Results")
-        print(f"{'='*60}")
-        print(f"  Train samples: {train_size:,}")
-        print(f"  Valid samples: {valid_size:,}")
-        print(f"  {metric_name}: {score:.6f}")
-    
-    
-    @staticmethod
-    def log_cv_summary(scores: List[float], metric_name: str = "Macro F1"):
-        """
-        CV全体のサマリーログ出力
+            X: DataFrameまたは配列（quarter列を含む必要あり）
+            y: ターゲット（未使用）
+            groups: グループ（未使用）
         
-        Args:
-            scores: 各Foldのスコアリスト
-            metric_name: メトリクス名
+        Yields:
+            (train_indices, valid_indices)のタプル
         """
-        print(f"\n{'='*60}")
-        print(f"Cross Validation Summary")
-        print(f"{'='*60}")
-        print(f"  {metric_name} - Mean: {np.mean(scores):.6f}")
-        print(f"  {metric_name} - Std:  {np.std(scores):.6f}")
-        print(f"  Fold scores: {[f'{s:.6f}' for s in scores]}")
-        print(f"{'='*60}")
+        if isinstance(X, pd.DataFrame):
+            quarters = X[self.quarter_col]
+        else:
+            raise ValueError("Q1Q2ValidatorはDataFrameが必要です")
+        
+        # Q1/Q2のマスクを作成
+        q1_mask = quarters.astype(str).str.startswith('Q1')
+        q2_mask = quarters.astype(str).str.startswith('Q2')
+        
+        q1_indices = X[q1_mask].index.values
+        q2_indices = X[q2_mask].index.values
+        
+        # Fold 0: Q2訓練 → Q1検証
+        yield q2_indices, q1_indices
+        
+        # Fold 1: Q1訓練 → Q2検証
+        yield q1_indices, q2_indices
+    
+    def get_n_splits(self, X=None, y=None, groups=None):
+        """Fold数を返す"""
+        return self.n_splits
