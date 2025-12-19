@@ -13,6 +13,7 @@ DIR_RAW = os.path.join(DIR_DATA, 'raw')
 DIR_INPUT = os.path.join(DIR_RAW, 'input')
 DIR_IMAGE = os.path.join(DIR_INPUT, 'images')
 DIR_CROPS = os.path.join(DIR_INPUT, 'crops')
+DIR_TRAIN_CROPS = os.path.join(DIR_INTERIM, 'train_crops')
 DIR_META = os.path.join(DIR_INPUT, 'atmaCup22_2nd_meta')
 
 # FILE

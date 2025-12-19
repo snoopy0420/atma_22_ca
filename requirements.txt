@@ -7,13 +7,21 @@ torch>=2.0.0
 torchvision>=0.15.0
 numpy>=1.24.0
 pandas>=2.0.0
+typing_extensions>=4.8.0
 
 # Image processing
 opencv-python>=4.8.0
+opencv-python-headless>=4.8.0
 Pillow>=10.0.0
 
 # Machine learning utilities
 scikit-learn>=1.3.0
+pytorch-lightning>=2.0.0
+torchmetrics>=1.0.0
+
+# Deep learning models and augmentation
+timm>=0.9.0
+albumentations>=1.3.0
 
 # Progress bar
 tqdm>=4.65.0
@@ -26,8 +34,3 @@ seaborn>=0.12.0
 # Jupyter notebook
 jupyter>=1.0.0
 notebook>=7.0.0
-
-# Optional: Advanced features (for future improvements)
-# timm>=0.9.0  # For EfficientNet and other models
-# faiss-cpu>=1.7.4  # For fast KNN search
-# albumentations>=1.3.0  # For data augmentation

@@ -11,9 +11,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import timm
+from timm.utils import ModelEmaV3
 from typing import Optional, Tuple
 from pathlib import Path
 from tqdm import tqdm
+from sklearn.metrics import f1_score
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import cv2
@@ -188,52 +190,7 @@ class PlayerEmbeddingModel(nn.Module):
             return F.normalize(embedding, p=2, dim=1)
 
 
-class EMAHelper:
-    """
-    Exponential Moving Average (EMA) ヘルパー
-    
-    訓練中のモデル重みの移動平均を保持することで、
-    より安定した汎化性能を得る
-    """
-
-    def __init__(self, model: nn.Module, decay: float = 0.995):
-        """
-        Args:
-            model: 追跡するモデル
-            decay: 減衰率（0.995 ~ 0.9998が一般的）
-        """
-        self.decay = decay
-        self.shadow = {}
-        self.backup = {}
-        
-        # 初期重みをコピー
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                self.shadow[name] = param.data.clone()
-
-    def update(self, model: nn.Module):
-        """EMA重みを更新（各最適化ステップ後に呼ぶ）"""
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                assert name in self.shadow
-                new_average = (1.0 - self.decay) * param.data + self.decay * self.shadow[name]
-                self.shadow[name] = new_average.clone()
-
-    def apply_shadow(self, model: nn.Module):
-        """モデルの重みをEMA重みに置き換え（推論前）"""
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                assert name in self.shadow
-                self.backup[name] = param.data.clone()
-                param.data = self.shadow[name]
-
-    def restore(self, model: nn.Module):
-        """モデルの重みを元に戻す（推論後）"""
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                assert name in self.backup
-                param.data = self.backup[name]
-        self.backup = {}
+# EMAはtimmのModelEmaV3を使用（RedBullと同じ実装）
 
 
 class ModelArcFace(Model):
@@ -257,7 +214,7 @@ class ModelArcFace(Model):
         super().__init__(run_fold_name, params, out_dir_name, logger)
         
         # パラメータ
-        self.model_name = params.get('model_name', 'efficientnet_b0')
+        self.model_name = params.get('model_name', 'resnet18')
         self.embedding_dim = params.get('embedding_dim', 512)
         self.img_size = params.get('img_size', 224)
         self.batch_size = params.get('batch_size', 64)
@@ -267,7 +224,7 @@ class ModelArcFace(Model):
         self.arcface_s = params.get('arcface_s', 30.0)
         self.arcface_m = params.get('arcface_m', 0.5)
         self.use_ema = params.get('use_ema', True)
-        self.ema_decay = params.get('ema_decay', 0.995)
+        self.ema_decay = params.get('ema_decay', 0.9998)  # RedBullと同じデフォルト値
         self.threshold = params.get('threshold', 0.5)
         self.num_workers = params.get('num_workers', 4)
         
@@ -306,22 +263,20 @@ class ModelArcFace(Model):
         """DataLoaderの作成"""
 
         # dataset
-        treatment_is_train = split in ['train', 'valid']
         dataset = BasketballDataset(
             df=df,
-            transform=self._get_transforms(train=treatment_is_train),
-            is_train=treatment_is_train
+            transform=self._get_transforms(train=(split in ['train'])),
+            is_train=(split in ['train', 'valid'])
         )
         
         # dataloader
-        treatment_is_train = split in ['train']
         return torch.utils.data.DataLoader(
             dataset,
             batch_size=self.batch_size,
-            shuffle=treatment_is_train,
+            shuffle=(split in ['train']),
             num_workers=self.num_workers,
             pin_memory=True,
-            drop_last=treatment_is_train,
+            drop_last=(split in ['train']),
         )
 
     def train(self, tr: pd.DataFrame, va: Optional[pd.DataFrame] = None) -> None:
@@ -351,9 +306,9 @@ class ModelArcFace(Model):
             arcface_m=self.arcface_m,
         ).to(self.device)
         
-        # EMA初期化
+        # EMA初期化（ModelEmaV3を使用）
         if self.use_ema:
-            self.ema = EMAHelper(self.model, decay=self.ema_decay)
+            self.ema = ModelEmaV3(self.model, decay=self.ema_decay)
             self.logger.info(f"  EMA有効 (decay={self.ema_decay})")
         
         # オプティマイザ・スケジューラ
@@ -375,10 +330,10 @@ class ModelArcFace(Model):
             # 訓練
             self.model.train()
             train_loss = 0.0
-            train_correct = 0
             train_total = 0
             
             pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{self.epochs}")
+            batch_idx = 0
             for batch in pbar:
                 images, labels = batch  # BasketballDatasetは(image, label)のタプルを返す
                 images = images.to(self.device)
@@ -399,49 +354,51 @@ class ModelArcFace(Model):
                 
                 # 統計
                 train_loss += loss.item() * images.size(0)
-                _, predicted = outputs.max(1)
                 train_total += labels.size(0)
-                train_correct += predicted.eq(labels).sum().item()
                 
-                pbar.set_postfix({'loss': f'{loss.item():.4f}', 'acc': f'{100.*train_correct/train_total:.2f}%'})
+                # 注意: 訓練時はArcFaceマージンにより正解クラスの出力値が意図的に小さくなるため、
+                # outputs.argmax()での精度評価は不可能です（常に0%になります）。
+                # 検証データでのみ正確な評価を行います。
+                
+                batch_idx += 1
+                pbar.set_postfix({'loss': f'{loss.item():.4f}'})
             
-            train_loss /= train_total
-            train_acc = 100. * train_correct / train_total
+            # エポック平均loss
+            avg_train_loss = train_loss / train_total
+            self.logger.info(f"Epoch {epoch+1}/{self.epochs}: Train Loss={avg_train_loss:.4f}")
             
             # 検証
             if val_loader is not None:
-                val_loss, val_acc = self._validate(val_loader, criterion)
-                self.logger.info(f"Epoch {epoch+1}: train_loss={train_loss:.4f}, train_acc={train_acc:.2f}%, "
-                               f"val_loss={val_loss:.4f}, val_acc={val_acc:.2f}%")
+                val_loss, val_f1 = self._validate(val_loader, criterion)
+                self.logger.info(f"  Val Loss={val_loss:.4f}, Val F1={val_f1:.4f}")
                 
                 # ベストモデル保存
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     self.save_model()
-            else:
-                self.logger.info(f"Epoch {epoch+1}: train_loss={train_loss:.4f}, train_acc={train_acc:.2f}%")
             
             scheduler.step()
         
-        # 最終モデル保存（検証データがない場合）
+        # 検証データがない場合は最終モデルを保存
         if val_loader is None:
             self.save_model()
         
         # プロトタイプ計算
         self.logger.info("クラスプロトタイプを計算中...")
         self._compute_prototypes(tr)
+
         self.logger.info("訓練完了")
 
     def _validate(self, val_loader, criterion) -> Tuple[float, float]:
-        """検証"""
-        self.model.eval()
-        val_loss = 0.0
-        val_correct = 0
-        val_total = 0
+        """検証（EMAモデルを使用）"""
+        # EMAモデルを評価モードに
+        model_to_eval = self.ema.module if self.use_ema else self.model
+        model_to_eval.eval()
         
-        # EMA重みを適用
-        if self.use_ema:
-            self.ema.apply_shadow(self.model)
+        val_loss = 0.0
+        val_total = 0
+        all_preds = []
+        all_labels = []
         
         with torch.no_grad():
             for batch in val_loader:
@@ -449,29 +406,27 @@ class ModelArcFace(Model):
                 images = images.to(self.device)
                 labels = labels.to(self.device)
                 
-                outputs = self.model(images, labels)
+                # 検証時はマージンなしで評価（labels=None）
+                outputs = model_to_eval(images, labels=None)
                 loss = criterion(outputs, labels)
                 
                 val_loss += loss.item() * images.size(0)
-                _, predicted = outputs.max(1)
                 val_total += labels.size(0)
-                val_correct += predicted.eq(labels).sum().item()
-        
-        # 元の重みに戻す
-        if self.use_ema:
-            self.ema.restore(self.model)
+                
+                # F1計算用に予測とラベルを保持
+                preds = outputs.argmax(dim=1)
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
         
         val_loss /= val_total
-        val_acc = 100. * val_correct / val_total
-        return val_loss, val_acc
+        val_f1 = f1_score(all_labels, all_preds, average='macro')
+        return val_loss, val_f1
 
     def _compute_prototypes(self, df: pd.DataFrame):
-        """クラスプロトタイプ（平均埋め込み）を計算"""
-        self.model.eval()
-        
-        # EMA重みを適用
-        if self.use_ema:
-            self.ema.apply_shadow(self.model)
+        """クラスプロトタイプ（平均埋め込み）を計算（EMAモデルを使用）"""
+        # EMAモデルを評価モードに
+        model_to_eval = self.ema.module if self.use_ema else self.model
+        model_to_eval.eval()
         
         # 全データの埋め込みを抽出
         dataloader = self._create_dataloader(df, split='train')
@@ -483,7 +438,7 @@ class ModelArcFace(Model):
                 images, labels = batch
                 images = images.to(self.device)
                 
-                embeddings = self.model.get_embedding(images)
+                embeddings = model_to_eval.get_embedding(images)
                 all_embeddings.append(embeddings.cpu())
                 all_labels.append(labels)
         
@@ -500,14 +455,10 @@ class ModelArcFace(Model):
                 self.prototypes[c] = F.normalize(prototype, p=2, dim=0)
         
         self.logger.info(f"プロトタイプ形状: {self.prototypes.shape}")
-        
-        # 元の重みに戻す
-        if self.use_ema:
-            self.ema.restore(self.model)
 
     def predict(self, te: pd.DataFrame, split='test') -> np.ndarray:
         """
-        予測
+        予測（EMAモデルを使用）
         
         Args:
             te: テストデータ
@@ -517,11 +468,9 @@ class ModelArcFace(Model):
         """
         self.logger.info(f"ArcFace予測開始: {len(te)}サンプル")
         
-        self.model.eval()
-        
-        # EMA重みを適用
-        if self.use_ema:
-            self.ema.apply_shadow(self.model)
+        # EMAモデルを評価モードに
+        model_to_eval = self.ema.module if self.use_ema else self.model
+        model_to_eval.eval()
         
         # テストデータの埋め込みを抽出
         dataloader = self._create_dataloader(te, split=split)
@@ -535,7 +484,7 @@ class ModelArcFace(Model):
                 else:
                     images = batch
                 images = images.to(self.device)
-                embeddings = self.model.get_embedding(images)
+                embeddings = model_to_eval.get_embedding(images)
                 all_embeddings.append(embeddings.cpu())
         
         all_embeddings = torch.cat(all_embeddings, dim=0)
@@ -558,10 +507,6 @@ class ModelArcFace(Model):
         unique, counts = np.unique(predictions, return_counts=True)
         self.logger.info(f"予測分布: {dict(zip(unique, counts))}")
         
-        # 元の重みに戻す
-        if self.use_ema:
-            self.ema.restore(self.model)
-        
         # 元のDataFrameのインデックスを保持
         result = pd.DataFrame({'label_id': predictions}, index=te.index)
         return result
@@ -572,11 +517,14 @@ class ModelArcFace(Model):
         proto_path = os.path.join(self.model_dir, 'prototypes.pth')
         
         # モデル保存
-        torch.save({
+        save_dict = {
             'model_state_dict': self.model.state_dict(),
-            'ema_shadow': self.ema.shadow if self.use_ema else None,
             'num_classes': self.num_classes,
-        }, model_path)
+        }
+        if self.use_ema:
+            save_dict['ema_state_dict'] = self.ema.module.state_dict()
+        
+        torch.save(save_dict, model_path)
         
         # プロトタイプ保存（計算済みの場合）
         if self.prototypes is not None:
@@ -609,9 +557,9 @@ class ModelArcFace(Model):
         self.model.load_state_dict(checkpoint['model_state_dict'])
         
         # EMA復元
-        if self.use_ema and checkpoint['ema_shadow'] is not None:
-            self.ema = EMAHelper(self.model, decay=self.ema_decay)
-            self.ema.shadow = checkpoint['ema_shadow']
+        if self.use_ema and 'ema_state_dict' in checkpoint:
+            self.ema = ModelEmaV3(self.model, decay=self.ema_decay)
+            self.ema.module.load_state_dict(checkpoint['ema_state_dict'])
         
         # プロトタイプ読み込み
         if os.path.exists(proto_path):
