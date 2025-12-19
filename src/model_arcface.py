@@ -1,568 +1,874 @@
 """
 ArcFace損失を用いた選手再識別モデル
-手動PyTorch訓練ループで既存Runnerと完全互換
+RedBullのPyTorch Lightningコードをそのまま使用
 """
 import os
 import sys
 import math
 import numpy as np
 import pandas as pd
+import cv2
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import timm
 from timm.utils import ModelEmaV3
-from typing import Optional, Tuple
+from typing import Optional
 from pathlib import Path
 from tqdm import tqdm
-from sklearn.metrics import f1_score
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
-import cv2
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint
+from torchmetrics import F1Score
+from torch.utils.data import Dataset, DataLoader
 
 sys.path.append(os.path.abspath('..'))
 from configs.config import *
 from src.model import Model
-from src.dataset_image import BasketballDataset
 
+
+# ============================================================================
+# Dataset & DataLoader (基本的にRedBullの実装をそのまま使用)
+# ============================================================================
+
+class PlayerDataset(Dataset):
+    """プレイヤー再識別用Dataset（RedBullベースライン互換）
+    
+    機能:
+    - 事前クロップ画像の読み込み（crop_dir指定時）
+    - オンザフライクロップ（パディング10%付き）
+    - 画像キャッシュ機能（cache_images=True時）
+    - RGB変換を明示的に実施
+    """
+    
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        transform: A.Compose,
+        cache_images: bool = False,
+    ):
+        # self.original_indices = df.index.tolist()  # 元のインデックスを保持
+        self.df = df.reset_index(drop=True)
+        self.transform = transform
+        self.cache_images = cache_images
+        self.image_cache = {}
+        self.crop_dir = Path(DIR_TRAIN_CROPS)
+    
+    def __len__(self) -> int:
+        return len(self.df)
+    
+    def _load_image(self, img_path: Path) -> np.ndarray:
+        """画像を読み込み（キャッシュ対応）"""
+        if self.cache_images and str(img_path) in self.image_cache:
+            return self.image_cache[str(img_path)]
+        
+        img = cv2.imread(str(img_path))
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)  # BGR→RGB変換
+        
+        if self.cache_images:
+            self.image_cache[str(img_path)] = img
+        
+        return img
+    
+    def __getitem__(self, idx: int) -> dict:
+        row = self.df.iloc[idx]
+        
+        # 事前クロップ画像を直接読み込む（元のインデックスを使用）
+        # original_idx = self.original_indices[idx]
+        # crop_path = self.crop_dir / f"{original_idx}.jpg"
+        crop_path = self.crop_dir / f"{row['index']}.jpg"
+        crop = self._load_image(crop_path)
+        
+        # Albumentations変換を適用
+        transformed = self.transform(image=crop)
+        image = transformed['image']
+        
+        # 重要: rowはreset_index後のものなので、label_idは正しく対応している
+        result = {
+            'image': image,
+            'angle': row['angle'],
+            'label': torch.tensor(row['label_id'], dtype=torch.long),
+        }
+        
+        return result
+
+
+class TestDataset(Dataset):
+    """テストデータ用Dataset"""
+    
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        transform: A.Compose,
+    ):
+        """
+        Args:
+            df: test_meta.csv
+            transform: Albumentations変換
+        """
+        self.df = df.reset_index(drop=True)
+        self.base_dir = DIR_INPUT
+        self.transform = transform
+    
+    def __len__(self) -> int:
+        return len(self.df)
+    
+    def __getitem__(self, idx: int) -> dict:
+
+        # rel_pathから直接画像を読み込む
+        row = self.df.iloc[idx]
+        img_path = f"{self.base_dir}/{row['rel_path']}"
+        img = cv2.imread(img_path)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        
+        # 変換を適用
+        transformed = self.transform(image=img)
+        image = transformed['image']
+        
+        return {'image': image}
+
+
+def _create_dataloader(df: pd.DataFrame, split: str = 'train', batch_size: int=32, num_workers: int=8, img_size: int=224) -> DataLoader:
+    """
+    DataLoaderを作成
+    """
+    
+    # カスタムcollate_fn: 辞書のリストをバッチ化
+    def collate_fn(batch):
+        if split == 'test':
+            # テストデータは画像のみ
+            return {'image': torch.stack([item['image'] for item in batch])}
+        else:
+            # 訓練/検証データは辞書形式
+            return {
+                'image': torch.stack([item['image'] for item in batch]),
+                'label': torch.stack([item['label'] for item in batch]),
+                'angle': [item['angle'] for item in batch],
+            }
+    
+    # テストデータは専用Datasetを使用（rel_path対応）
+    if split == 'test':
+        dataset = TestDataset(
+            df=df,
+            transform=_get_transforms(train=False, img_size=img_size)  # テスト時変換,
+        )
+    elif split == 'train':
+        
+        dataset = PlayerDataset(
+            df=df,
+            transform=_get_transforms(train=True, img_size=img_size),
+            cache_images=False,  # 大規模データセットではメモリ不足に注意
+        )
+    elif split == 'valid':
+        
+        dataset = PlayerDataset(
+            df=df,
+            transform=_get_transforms(train=False, img_size=img_size),
+            cache_images=False,  # 大規模データセットではメモリ不足に注意
+        )
+    
+    # DataLoader作成（RedBullの設定を踏襲）
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=(split in ['train']),  # 訓練時のみシャッフル
+        num_workers=num_workers,  # マルチプロセス読み込み
+        pin_memory=True,  # GPU転送高速化
+        drop_last=(split in ['train']),  # 訓練時のみ端数バッチを削除（安定性向上）
+        persistent_workers=num_workers > 0,  # ワーカープロセスの再利用（高速化）
+        prefetch_factor=4 if num_workers > 0 else None,  # プリフェッチ数（I/O効率化）
+        collate_fn=collate_fn,  # カスタムバッチ化関数
+    )
+
+
+def _get_transforms(train: bool = True, img_size: int = 224) -> A.Compose:
+    """
+    画像変換パイプラインを取得（RedBullベースラインと同一）
+    
+    訓練時:
+    - データ拡張（Data Augmentation）で多様性を増やし過学習防止
+    - 幾何学的変換: Flip, Shift, Scale, Rotate
+    - 色変換: Brightness, Contrast, Saturation, Hue
+    
+    推論時:
+    - データ拡張なし、リサイズと正規化のみ
+    
+    Args:
+        train: 訓練モードかどうか
+    
+    Returns:
+        Albumentations変換パイプライン
+    """
+    if train:
+        return A.Compose([
+            A.Resize(img_size, img_size),  # リサイズ（例: 224x224）
+            A.HorizontalFlip(p=0.5),  # 水平反転（50%確率）
+            A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.1, rotate_limit=15, p=0.5),  # 平行移動/拡大縮小/回転
+            A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.5),  # 色調変換
+            A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),  # ImageNet統計で正規化
+            ToTensorV2(),  # NumPy配列→PyTorchテンソル変換
+        ])
+    else:
+        return A.Compose([
+            A.Resize(img_size, img_size),  # リサイズのみ
+            A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),  # ImageNet正規化
+            ToTensorV2(),
+        ])
+
+
+
+# ============================================================================
+# ArcFace Model Components
+# ============================================================================
 
 class ArcFaceHead(nn.Module):
     """
-    ArcFace損失関数のヘッド
+    ArcFace損失関数のヘッド部分
     
-    参考文献: ArcFace: Additive Angular Margin Loss for Deep Face Recognition
-    https://arxiv.org/abs/1801.07698
+    アーキテクチャ:
+    - 重み行列 W: [num_classes, embedding_dim]
+    - 入力埋め込みとWを正規化してcos類似度を計算
+    - 訓練時: 正解クラスの角度にマージンmを追加してcos類似度を減少させる
+    - 推論時: 単純なcos類似度にスケールsを掛ける
     
-    主な特徴:
-    - 特徴量とクラス重みを単位球面上に正規化
-    - コサイン類似度ベースの分類
-    - 正解クラスに角度マージン(m)を追加
-    - スケールファクター(s)で勾配調整
+    数式:
+    - cos(θ) = W^T * x / (||W|| * ||x||)  # 正規化された内積
+    - φ = cos(θ + m) = cos(θ)cos(m) - sin(θ)sin(m)  # 角度マージン追加
+    - output = s * φ (正解クラス) or s * cos(θ) (その他)
+    
+    Args:
+        in_features: 入力埋め込み次元（例: 512）
+        out_features: 出力クラス数（選手数、例: 11）
+        s: スケールパラメータ（類似度のスケーリング、通常30.0）
+        m: マージンパラメータ（角度マージン、通常0.5 rad ≈ 28.6度）
+        easy_margin: 簡単なマージン適用方法を使用するか
     """
 
-    def __init__(self, in_features: int, out_features: int, s: float = 30.0, m: float = 0.5):
-        """
-        Args:
-            in_features: 入力埋め込み次元数
-            out_features: クラス数
-            s: スケールファクター（デフォルト: 30.0）
-            m: 角度マージン（デフォルト: 0.5 rad ≈ 28.6度）
-        """
+    def __init__(self, in_features: int, out_features: int, s: float = 30.0, m: float = 0.5, easy_margin: bool = False):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.s = s
-        self.m = m
+        self.s = s  # スケールパラメータ（logitのスケーリング）
+        self.m = m  # 角度マージン（rad単位）
+        self.easy_margin = easy_margin
 
-        # クラス重み（学習可能パラメータ）
+        # クラスごとの重みベクトル（正規化して使用）
         self.weight = nn.Parameter(torch.FloatTensor(out_features, in_features))
         nn.init.xavier_uniform_(self.weight)
 
-        # 角度マージン計算用の定数
-        self.cos_m = math.cos(m)
-        self.sin_m = math.sin(m)
-        self.th = math.cos(math.pi - m)
-        self.mm = math.sin(math.pi - m) * m
+        # 角度マージンの事前計算（cos/sin加法定理用）
+        self.cos_m = math.cos(m)  # cos(m)
+        self.sin_m = math.sin(m)  # sin(m)
+        self.th = math.cos(math.pi - m)  # 閾値: cos(π-m)
+        self.mm = math.sin(math.pi - m) * m  # マージン補正項
 
     def forward(self, x: torch.Tensor, labels: torch.Tensor = None) -> torch.Tensor:
         """
-        順伝播
+        順伝播処理
+        
+        処理フロー:
+        1. 入力xと重みWをL2正規化
+        2. cos類似度を計算（正規化された内積）
+        3. 訓練時: 正解クラスに角度マージンm追加
+        4. スケールsを掛けてlogitとして出力
         
         Args:
-            x: 入力埋め込み [batch_size, in_features]
-            labels: ターゲットラベル [batch_size] (推論時はNone)
-            
+            x: 埋め込みベクトル [batch_size, embedding_dim]
+            labels: 正解ラベル [batch_size] (訓練時のみ)
+        
         Returns:
-            訓練時: ArcFaceロジット [batch_size, out_features]
-            推論時: スケール済みコサイン類似度 [batch_size, out_features]
+            logits: [batch_size, num_classes]
         """
-        # 特徴量と重みを正規化（単位球面上に配置）
-        x_norm = F.normalize(x, p=2, dim=1)
-        w_norm = F.normalize(self.weight, p=2, dim=1)
+        # 1. 正規化（埋め込みと重みを単位ベクトル化）
+        x_norm = F.normalize(x, p=2, dim=1)  # [B, D] -> 各行をL2正規化
+        w_norm = F.normalize(self.weight, p=2, dim=1)  # [C, D] -> 各行をL2正規化
+        
+        # 2. cos類似度計算（正規化された内積）
+        cosine = F.linear(x_norm, w_norm)  # [B, C]: cos(θ_i,j)
 
-        # コサイン類似度計算
-        cosine = F.linear(x_norm, w_norm)
-
+        # 推論時: スケールのみ適用して返す
         if labels is None:
-            # 推論モード: スケール済みコサイン類似度を返す
             return cosine * self.s
 
-        # 訓練モード: 角度マージンを適用
+        # 3. 訓練時: 正解クラスに角度マージンを追加
+        # sin(θ) = sqrt(1 - cos^2(θ))
         sine = torch.sqrt(1.0 - torch.clamp(cosine * cosine, 0, 1))
-        phi = cosine * self.cos_m - sine * self.sin_m  # cos(θ + m)
+        # φ = cos(θ + m) = cos(θ)cos(m) - sin(θ)sin(m)
+        phi = cosine * self.cos_m - sine * self.sin_m
 
-        # 閾値処理
-        phi = torch.where(cosine > self.th, phi, cosine - self.mm)
+        # マージン適用の条件分岐
+        if self.easy_margin:
+            # cos(θ) > 0 の場合のみマージン適用
+            phi = torch.where(cosine > 0, phi, cosine)
+        else:
+            # cos(θ) > cos(π-m) の場合にマージン適用、それ以外は線形補正
+            phi = torch.where(cosine > self.th, phi, cosine - self.mm)
 
-        # ワンホットエンコーディング
+        # 4. 正解クラスのみφを使い、その他はcosineを使う
         one_hot = torch.zeros_like(cosine)
-        one_hot.scatter_(1, labels.view(-1, 1).long(), 1)
-
-        # ターゲットクラスにのみマージンを適用
+        one_hot.scatter_(1, labels.view(-1, 1).long(), 1)  # 正解位置に1
         output = (one_hot * phi) + ((1.0 - one_hot) * cosine)
-        output *= self.s
-
+        output *= self.s  # スケーリング
         return output
 
 
 class PlayerEmbeddingModel(nn.Module):
     """
-    選手再識別のための埋め込みモデル
+    選手埋め込みモデル全体のアーキテクチャ
     
-    アーキテクチャ:
-        入力画像 → Backbone (CNN) → 埋め込み層 → ArcFaceヘッド
+    構成:
+    1. Backbone: EfficientNet/ResNetなどの事前学習済みCNN（特徴抽出）
+       - 入力: [B, 3, H, W] RGB画像
+       - 出力: [B, backbone_dim] 特徴ベクトル（例: 1280次元）
+    
+    2. Embedding: 特徴を埋め込み空間に射影
+       - BatchNorm -> Dropout -> Linear -> BatchNorm
+       - 出力: [B, embedding_dim] 正規化された埋め込み（例: 512次元）
+    
+    3. ArcFace Head: 埋め込みから各クラスへの類似度を計算
+       - 訓練時: 角度マージンを追加した損失計算用logits
+       - 推論時: プロトタイプとのcos類似度
+    
+    使用法:
+    - 訓練: model(x, labels) -> ArcFace損失用のlogits
+    - 推論: model.get_embedding(x) -> 埋め込みベクトル（プロトタイプ比較用）
+    
+    Args:
+        model_name: Backboneモデル名（timm対応モデル）
+        embedding_dim: 埋め込み次元数（通常512）
+        num_classes: 選手クラス数
+        pretrained: ImageNet事前学習済み重みを使用するか
+        arcface_s: ArcFaceスケールパラメータ
+        arcface_m: ArcFace角度マージン
     """
 
-    def __init__(
-        self,
-        model_name: str = "efficientnet_b0",
-        embedding_dim: int = 512,
-        num_classes: int = 11,
-        pretrained: bool = True,
-        arcface_s: float = 30.0,
-        arcface_m: float = 0.5,
-    ):
-        """
-        Args:
-            model_name: バックボーンモデル名（timmライブラリ）
-            embedding_dim: 埋め込みベクトル次元数
-            num_classes: 訓練データのクラス数
-            pretrained: ImageNet事前訓練重みを使用するか
-            arcface_s: ArcFaceスケールパラメータ
-            arcface_m: ArcFace角度マージン
-        """
+    def __init__(self, model_name: str = "efficientnet_b0", embedding_dim: int = 512,
+                 num_classes: int = 11, pretrained: bool = True,
+                 arcface_s: float = 30.0, arcface_m: float = 0.5):
         super().__init__()
+        # Backbone: 事前学習済みCNN（最終分類層なし）
+        self.backbone = timm.create_model(model_name, pretrained=pretrained, num_classes=0)
+        backbone_out = self.backbone.num_features  # Backboneの出力次元
 
-        # バックボーン（分類器なし）
-        self.backbone = timm.create_model(
-            model_name,
-            pretrained=pretrained,
-            num_classes=0,  # 分類器を削除
-        )
-
-        # バックボーンの出力特徴量数
-        backbone_out = self.backbone.num_features
-
-        # 埋め込み層（BN-Dropout-FC-BN構成）
+        # Embedding Layer: 特徴を低次元埋め込み空間に射影
         self.embedding = nn.Sequential(
-            nn.BatchNorm1d(backbone_out),
-            nn.Dropout(0.3),
-            nn.Linear(backbone_out, embedding_dim, bias=False),
-            nn.BatchNorm1d(embedding_dim),
+            nn.BatchNorm1d(backbone_out),  # バッチ正規化
+            nn.Dropout(0.3),  # 過学習防止
+            nn.Linear(backbone_out, embedding_dim, bias=False),  # 線形射影
+            nn.BatchNorm1d(embedding_dim),  # 埋め込みの正規化
         )
 
-        # 訓練用ArcFaceヘッド
-        self.arcface = ArcFaceHead(
-            in_features=embedding_dim,
-            out_features=num_classes,
-            s=arcface_s,
-            m=arcface_m,
-        )
-
+        # ArcFace Head: 埋め込みをクラスlogitsに変換
+        self.arcface = ArcFaceHead(in_features=embedding_dim, out_features=num_classes,
+                                   s=arcface_s, m=arcface_m)
         self.embedding_dim = embedding_dim
 
     def get_embedding(self, x: torch.Tensor) -> torch.Tensor:
-        """正規化された埋め込みベクトルを抽出"""
-        features = self.backbone(x)
-        embedding = self.embedding(features)
-        return F.normalize(embedding, p=2, dim=1)
+        """
+        画像から正規化された埋め込みベクトルを取得（推論用）
+        
+        処理: 画像 -> Backbone -> Embedding -> L2正規化
+        用途: プロトタイプとのcos類似度計算に使用
+        
+        Args:
+            x: 入力画像 [B, 3, H, W]
+        Returns:
+            正規化埋め込み [B, embedding_dim]、各ベクトルのL2ノルムは1
+        """
+        features = self.backbone(x)  # [B, backbone_dim]
+        embedding = self.embedding(features)  # [B, embedding_dim]
+        return F.normalize(embedding, p=2, dim=1)  # L2正規化
 
     def forward(self, x: torch.Tensor, labels: torch.Tensor = None) -> torch.Tensor:
         """
-        順伝播
+        順伝播（訓練時と推論時で動作が異なる）
+        
+        訓練時（labels指定）: ArcFace損失計算用のlogitsを返す
+        推論時（labels=None）: 正規化埋め込みを返す
         
         Args:
-            x: 入力画像 [batch_size, 3, H, W]
-            labels: ターゲットラベル [batch_size] (推論時はNone)
-            
+            x: 入力画像 [B, 3, H, W]
+            labels: 正解ラベル [B]（訓練時のみ）
+        
         Returns:
-            訓練時: ArcFaceロジット [batch_size, num_classes]
-            推論時: 正規化埋め込み [batch_size, embedding_dim]
+            訓練時: ArcFaceのlogits [B, num_classes]
+            推論時: 正規化埋め込み [B, embedding_dim]
         """
-        features = self.backbone(x)
-        embedding = self.embedding(features)
-
+        features = self.backbone(x)  # Backbone特徴抽出
+        embedding = self.embedding(features)  # 埋め込み射影
         if labels is not None:
-            # 訓練時: ArcFaceロジットを返す
+            # 訓練時: ArcFace損失用のlogits
             return self.arcface(embedding, labels)
         else:
-            # 推論時: 正規化埋め込みを返す
+            # 推論時: 正規化埋め込み
             return F.normalize(embedding, p=2, dim=1)
 
 
-# EMAはtimmのModelEmaV3を使用（RedBullと同じ実装）
+class PlayerModule(pl.LightningModule):
+    """
+    PyTorch Lightning統合版の訓練モジュール
+    
+    機能:
+    - PlayerEmbeddingModelのラッパー
+    - 訓練ループ（loss計算、最適化、ログ記録）
+    - 検証ループ（F1スコア計算）
+    - EMA（Exponential Moving Average）モデルの管理
+    - 学習率スケジューリング（Cosine Annealing）
+    
+    EMA（指数移動平均）:
+    - 訓練中のモデル重みの移動平均を保持
+    - より安定した予測性能（推論時はEMAモデル使用）
+    - 更新式: θ_ema = decay * θ_ema + (1-decay) * θ_current
+    
+    訓練プロセス:
+    1. 画像 -> モデル -> ArcFace logits
+    2. CrossEntropyLoss計算
+    3. Backprop & 最適化
+    4. EMAモデル更新
+    5. F1スコア記録
+    
+    Args:
+        model_name: Backboneモデル名
+        num_classes: 選手クラス数
+        pretrained: 事前学習済み重み使用
+        embedding_dim: 埋め込み次元
+        arcface_s/m: ArcFaceパラメータ
+        lr: 学習率
+        weight_decay: L2正則化係数
+        epochs: エポック数
+        ema_decay: EMA減衰率（0.9998推奨）
+        use_ema: EMA使用フラグ
+    """
+
+    def __init__(self, model_name: str = "efficientnet_b0", num_classes: int = 11,
+                 pretrained: bool = True, embedding_dim: int = 512,
+                 arcface_s: float = 30.0, arcface_m: float = 0.5,
+                 lr: float = 1e-3, weight_decay: float = 1e-4, epochs: int = 20,
+                 ema_decay: float = 0.9998, use_ema: bool = True):
+        super().__init__()
+        self.save_hyperparameters()  # チェックポイント保存用
+
+        # メインモデル
+        self.model = PlayerEmbeddingModel(
+            model_name=model_name, num_classes=num_classes, pretrained=pretrained,
+            embedding_dim=embedding_dim, arcface_s=arcface_s, arcface_m=arcface_m
+        )
+        
+        # 損失関数とメトリクス
+        self.criterion = nn.CrossEntropyLoss()  # ArcFace logitsに対する交差エントロピー
+        self.train_f1 = F1Score(task="multiclass", num_classes=num_classes, average="macro")
+        self.val_f1 = F1Score(task="multiclass", num_classes=num_classes, average="macro")
+
+        # EMA（Exponential Moving Average）設定
+        self.use_ema = use_ema
+        self.ema_decay = ema_decay
+        self.model_ema = None  # setup()で初期化
+
+    def setup(self, stage: str = None):
+        """訓練開始前にEMAモデルを初期化"""
+        if self.use_ema and self.model_ema is None:
+            self.model_ema = ModelEmaV3(self.model, decay=self.ema_decay, device=self.device)
+
+    def forward(self, x: torch.Tensor, labels: torch.Tensor = None) -> torch.Tensor:
+        """メインモデルの順伝播"""
+        return self.model(x, labels)
+
+    def get_embedding(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        埋め込み取得（推論時はEMAモデル使用）
+        
+        プロトタイプ計算・推論時に使用
+        EMA有効時はより安定したEMAモデルで埋め込み抽出
+        """
+        if self.use_ema and self.model_ema is not None:
+            return self.model_ema.module.get_embedding(x)
+        return self.model.get_embedding(x)
+
+    def forward_ema(self, x: torch.Tensor, labels: torch.Tensor = None) -> torch.Tensor:
+        """EMAモデルの順伝播（検証時に使用）"""
+        if self.model_ema is not None:
+            return self.model_ema.module(x, labels)
+        return self.model(x, labels)
+
+    def on_before_zero_grad(self, optimizer):
+        """
+        勾配をゼロにする前にEMAモデルを更新
+        
+        各最適化ステップ後に自動的に呼ばれる
+        θ_ema = decay * θ_ema + (1-decay) * θ_current
+        """
+        if self.use_ema and self.model_ema is not None:
+            self.model_ema.update(self.model)
+
+    def training_step(self, batch: dict, batch_idx: int) -> torch.Tensor:
+        images = batch["image"]
+        labels = batch["label"]
+        # ArcFaceマージンのためにラベル付きで順伝播
+        outputs = self(images, labels)
+        loss = self.criterion(outputs, labels)
+        preds = outputs.argmax(dim=1)
+        self.train_f1(preds, labels)
+        self.log("train_loss", loss, prog_bar=False, on_step=True, on_epoch=True)
+        self.log("train_f1", self.train_f1, prog_bar=False, on_step=False, on_epoch=True)
+        return loss
+
+    def validation_step(self, batch: dict, batch_idx: int) -> torch.Tensor:
+        images = batch["image"]
+        labels = batch["label"]
+        
+        # 検証にはEMAモデルを使用（適切なマージンのためにラベル付き）
+        if self.use_ema and self.model_ema is not None:
+            outputs = self.forward_ema(images, labels)
+        else:
+            outputs = self(images, labels)
+        
+        loss = self.criterion(outputs, labels)
+        preds = outputs.argmax(dim=1)
+        
+        self.val_f1(preds, labels)
+        self.log("val_loss", loss, prog_bar=False, on_step=False, on_epoch=True)
+        self.log("val_f1", self.val_f1, prog_bar=False, on_step=False, on_epoch=True)
+        return loss
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr,
+                                     weight_decay=self.hparams.weight_decay)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.hparams.epochs)
+        return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"}}
+
+
+@torch.no_grad()
+def compute_prototypes(model: PlayerModule, dataloader, num_classes: int, device) -> torch.Tensor:
+    """
+    各クラスのプロトタイプ（代表埋め込み）を計算
+    
+    プロトタイプベース分類:
+    1. 訓練データの各クラスの埋め込みを抽出
+    2. クラスごとに埋め込みの平均を計算
+    3. 平均ベクトルをL2正規化してプロトタイプとする
+    4. 推論時: テスト埋め込みと各プロトタイプのcos類似度で分類
+    
+    利点:
+    - 新しい選手（クラス）を追加しやすい（Few-shot学習）
+    - クラス不均衡に強い
+    - cos類似度の閾値で「unknown」を判定可能
+    
+    Args:
+        model: 訓練済みPlayerModule
+        dataloader: 訓練データローダー
+        num_classes: クラス数
+        device: 計算デバイス
+    
+    Returns:
+        prototypes: [num_classes, embedding_dim] 各クラスの正規化プロトタイプ
+    """
+    model.eval()
+    # クラスごとの埋め込みリストを初期化
+    class_embeddings = {i: [] for i in range(num_classes)}
+    
+    # 全訓練データの埋め込みを抽出
+    for batch in tqdm(dataloader, desc="プロトタイプ計算"):
+        images = batch["image"].to(device, non_blocking=True)  # 非同期転送で高速化
+        labels = batch["label"]
+        embeddings = model.get_embedding(images)  # EMAモデル使用
+        
+        # クラスごとに埋め込みを蓄積
+        for emb, label in zip(embeddings.cpu(), labels):
+            class_embeddings[label.item()].append(emb)
+    
+    # クラスごとの平均埋め込み（プロトタイプ）を計算
+    prototypes = torch.zeros(num_classes, embeddings.shape[1])
+    for class_id in range(num_classes):
+        if len(class_embeddings[class_id]) > 0:
+            class_embs = torch.stack(class_embeddings[class_id])  # [N, D]
+            prototype = class_embs.mean(dim=0)  # 平均: [D]
+            prototypes[class_id] = F.normalize(prototype, p=2, dim=0)  # L2正規化
+    return prototypes
 
 
 class ModelArcFace(Model):
     """
-    ArcFace損失を用いた選手再識別モデル
-    既存Runnerと完全互換の実装
+    Runner統合版ArcFaceモデル
     
-    【学習フェーズ】
-    1. PyTorch標準の訓練ループでArcFace損失を最小化
-    2. EMAで重みを平滑化
-    3. 訓練データ全体からクラスプロトタイプ（平均埋め込み）を計算
+    全体フロー:
+    1. 訓練: PlayerModule（PyTorch Lightning）でArcFace損失により学習
+    2. プロトタイプ計算: 訓練データから各クラスの代表埋め込みを生成
+    3. 推論: テスト画像の埋め込みとプロトタイプのcos類似度で分類
+    4. 閾値判定: 類似度が閾値未満の場合は「unknown」(-1)と判定
     
-    【推論フェーズ】
-    1. テスト画像から埋め込みを抽出
-    2. プロトタイプとのコサイン類似度を計算
-    3. 最も類似度が高いクラスを予測
-    4. 閾値判定でunknown（-1）を予測
+    アーキテクチャの特徴:
+    - Backbone: EfficientNet-B0（ImageNet事前学習済み）
+    - Embedding: 512次元の正規化埋め込み空間
+    - 損失: ArcFace（角度マージンによる識別性向上）
+    - 正則化: BatchNorm + Dropout + EMA
+    - 最適化: AdamW + Cosine Annealing LR
+    
+    ハイパーパラメータ:
+    - arcface_s: 30.0（スケール）
+    - arcface_m: 0.5（角度マージン、約28.6度）
+    - threshold: 0.5（unknown判定閾値）
+    - ema_decay: 0.9998（移動平均の減衰率）
     """
 
     def __init__(self, run_fold_name: str, params: dict, out_dir_name: str, logger) -> None:
+        """
+        ArcFaceモデルの初期化
+        
+        Args:
+            run_fold_name: 実行名（例: "arcface_efficientnet_b0_202512190149_fold-0"）
+            params: ハイパーパラメータ辞書
+            out_dir_name: モデル保存先ディレクトリ（例: "models/"）
+            logger: ロギングオブジェクト
+        """
         super().__init__(run_fold_name, params, out_dir_name, logger)
         
-        # パラメータ
-        self.model_name = params.get('model_name', 'resnet18')
-        self.embedding_dim = params.get('embedding_dim', 512)
-        self.img_size = params.get('img_size', 224)
+        # モデルアーキテクチャ設定
+        self.model_name = params.get('model_name', 'efficientnet_b0')  # Backboneモデル
+        self.embedding_dim = params.get('embedding_dim', 512)  # 埋め込み次元
+        self.img_size = params.get('img_size', 224)  # 入力画像サイズ
+        
+        # 訓練設定
         self.batch_size = params.get('batch_size', 64)
         self.epochs = params.get('epochs', 20)
-        self.lr = params.get('lr', 1e-3)
-        self.weight_decay = params.get('weight_decay', 1e-4)
-        self.arcface_s = params.get('arcface_s', 30.0)
-        self.arcface_m = params.get('arcface_m', 0.5)
-        self.use_ema = params.get('use_ema', True)
-        self.ema_decay = params.get('ema_decay', 0.9998)  # RedBullと同じデフォルト値
-        self.threshold = params.get('threshold', 0.5)
-        self.num_workers = params.get('num_workers', 4)
+        self.lr = params.get('lr', 1e-3)  # 学習率
+        self.weight_decay = params.get('weight_decay', 1e-4)  # L2正則化
         
-        # デバイス
+        # ArcFace損失パラメータ
+        self.arcface_s = params.get('arcface_s', 30.0)  # スケール（logitの増幅）
+        self.arcface_m = params.get('arcface_m', 0.5)  # 角度マージン（rad）
+        
+        # EMA（指数移動平均）設定
+        self.use_ema = params.get('use_ema', True)
+        self.ema_decay = params.get('ema_decay', 0.995)  # 減衰率（RedBull推奨値: 短期訓練に適切）
+        
+        # 推論設定
+        self.threshold = params.get('threshold', 0.5)  # cos類似度閾値（unknown判定用）
+        self.num_workers = params.get('num_workers', 8)  # DataLoaderワーカー数（GPU待ち時間を削減）
+        
+        # デバイス設定
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        # モデル保存先
+        # モデル保存ディレクトリ
         self.model_dir = os.path.join(out_dir_name, run_fold_name)
         os.makedirs(self.model_dir, exist_ok=True)
         
-        # 初期化（trainで作成）
-        self.model = None
-        self.ema = None
-        self.prototypes = None
-        self.num_classes = None
+        # 訓練/推論時に使用する変数（初期化時はNone）
+        self.pl_module = None  # PyTorch Lightningモジュール
+        self.prototypes = None  # 各クラスの代表埋め込み [num_classes, embedding_dim]
+        self.num_classes = None  # 選手クラス数
 
-    def _get_transforms(self, train: bool = True) -> A.Compose:
-        """データ拡張の定義"""
-        if train:
-            return A.Compose([
-                A.Resize(self.img_size, self.img_size),
-                A.HorizontalFlip(p=0.5),
-                A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.1, rotate_limit=15, p=0.5),
-                A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.5),
-                A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-                ToTensorV2(),
-            ])
-        else:
-            return A.Compose([
-                A.Resize(self.img_size, self.img_size),
-                A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-                ToTensorV2(),
-            ])
-
-    def _create_dataloader(self, df: pd.DataFrame, split: bool = 'train') -> torch.utils.data.DataLoader:
-        """DataLoaderの作成"""
-
-        # dataset
-        dataset = BasketballDataset(
-            df=df,
-            transform=self._get_transforms(train=(split in ['train'])),
-            is_train=(split in ['train', 'valid'])
-        )
-        
-        # dataloader
-        return torch.utils.data.DataLoader(
-            dataset,
-            batch_size=self.batch_size,
-            shuffle=(split in ['train']),
-            num_workers=self.num_workers,
-            pin_memory=True,
-            drop_last=(split in ['train']),
-        )
 
     def train(self, tr: pd.DataFrame, va: Optional[pd.DataFrame] = None) -> None:
         """
-        モデルの訓練
+        モデル訓練の実行
+        
+        訓練フロー:
+        1. ハイパーパラメータをログ出力
+        2. PlayerModule（PyTorch Lightning）を初期化
+        3. DataLoaderを作成
+        4. ModelCheckpointコールバック設定（val_loss最小のモデルを保存）
+        5. PyTorch Lightning Trainerで訓練実行
+        6. ベストモデルをロード
+        7. 訓練データからプロトタイプ（各クラスの代表埋め込み）を計算・保存
         
         Args:
-            tr: 訓練データ
-            va: 検証データ（オプション）
+            tr: 訓練データフレーム（画像パス、label_idを含む）
+            va: 検証データフレーム（オプション）
         """
+        # 訓練設定をログ出力
         self.logger.info(f"ArcFace訓練開始: {len(tr)}サンプル")
-        self.logger.info(f"  モデル: {self.model_name}, 埋め込み次元: {self.embedding_dim}")
-        self.logger.info(f"  バッチサイズ: {self.batch_size}, エポック: {self.epochs}")
+        self.logger.info(f"  モデル: {self.model_name}, 次元: {self.embedding_dim}")
+        self.logger.info(f"  バッチ: {self.batch_size}, エポック: {self.epochs}")
         self.logger.info(f"  ArcFace (s={self.arcface_s}, m={self.arcface_m})")
-        
-        # クラス数を取得
+        self.logger.info(f"  EMA: {self.use_ema} (decay={self.ema_decay})")
         self.num_classes = tr['label_id'].nunique()
         self.logger.info(f"  クラス数: {self.num_classes}")
         
-        # モデル作成
-        self.model = PlayerEmbeddingModel(
-            model_name=self.model_name,
-            embedding_dim=self.embedding_dim,
-            num_classes=self.num_classes,
-            pretrained=True,
-            arcface_s=self.arcface_s,
+        # PLモジュールを初期化
+        self.pl_module = PlayerModule(
+            model_name=self.model_name, 
+            num_classes=self.num_classes, 
+            pretrained=True,  # ImageNet事前学習済み重み使用
+            embedding_dim=self.embedding_dim, 
+            arcface_s=self.arcface_s, 
             arcface_m=self.arcface_m,
-        ).to(self.device)
-        
-        # EMA初期化（ModelEmaV3を使用）
-        if self.use_ema:
-            self.ema = ModelEmaV3(self.model, decay=self.ema_decay)
-            self.logger.info(f"  EMA有効 (decay={self.ema_decay})")
-        
-        # オプティマイザ・スケジューラ
-        optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=self.lr,
-            weight_decay=self.weight_decay
+            lr=self.lr, 
+            weight_decay=self.weight_decay, 
+            epochs=self.epochs,
+            ema_decay=self.ema_decay, 
+            use_ema=self.use_ema
         )
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.epochs)
-        criterion = nn.CrossEntropyLoss()
         
-        # DataLoader
-        train_loader = self._create_dataloader(tr, split='train')
-        val_loader = self._create_dataloader(va, split='valid') if va is not None else None
+        # コールバック
+        callbacks = [
+            ModelCheckpoint(
+                dirpath=self.model_dir, 
+                filename='best',
+                monitor='val_f1',
+                mode='max',  # 最小値を保存
+                save_top_k=1,  # ベスト1つのみ保存
+                verbose=True,
+                enable_version_counter=False,
+            )
+        ]
         
-        # 訓練ループ
-        best_val_loss = float('inf')
-        for epoch in range(self.epochs):
-            # 訓練
-            self.model.train()
-            train_loss = 0.0
-            train_total = 0
-            
-            pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{self.epochs}")
-            batch_idx = 0
-            for batch in pbar:
-                images, labels = batch  # BasketballDatasetは(image, label)のタプルを返す
-                images = images.to(self.device)
-                labels = labels.to(self.device)
-                
-                # 順伝播
-                optimizer.zero_grad()
-                outputs = self.model(images, labels)
-                loss = criterion(outputs, labels)
-                
-                # 逆伝播
-                loss.backward()
-                optimizer.step()
-                
-                # EMA更新
-                if self.use_ema:
-                    self.ema.update(self.model)
-                
-                # 統計
-                train_loss += loss.item() * images.size(0)
-                train_total += labels.size(0)
-                
-                # 注意: 訓練時はArcFaceマージンにより正解クラスの出力値が意図的に小さくなるため、
-                # outputs.argmax()での精度評価は不可能です（常に0%になります）。
-                # 検証データでのみ正確な評価を行います。
-                
-                batch_idx += 1
-                pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-            
-            # エポック平均loss
-            avg_train_loss = train_loss / train_total
-            self.logger.info(f"Epoch {epoch+1}/{self.epochs}: Train Loss={avg_train_loss:.4f}")
-            
-            # 検証
-            if val_loader is not None:
-                val_loss, val_f1 = self._validate(val_loader, criterion)
-                self.logger.info(f"  Val Loss={val_loss:.4f}, Val F1={val_f1:.4f}")
-                
-                # ベストモデル保存
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    self.save_model()
-            
-            scheduler.step()
-        
-        # 検証データがない場合は最終モデルを保存
-        if val_loader is None:
-            self.save_model()
-        
-        # プロトタイプ計算
-        self.logger.info("クラスプロトタイプを計算中...")
-        self._compute_prototypes(tr)
+        # Trainer初期化
+        trainer = pl.Trainer(
+            max_epochs=self.epochs,
+            accelerator='gpu' if torch.cuda.is_available() else 'cpu',
+            devices=1,  # GPU 1台使用（autoだとマルチGPU設定で遅延の可能性）
+            callbacks=callbacks,
+            enable_progress_bar=False,  # プログレスバー表示
+            enable_model_summary=True,  # モデル概要表示
+            logger=False,  # ロガー設定
+            precision="16-mixed",  # 混合精度で高速化
+        )
 
+        # DataLoader作成
+        train_loader = _create_dataloader(tr, 'train', self.batch_size, self.num_workers, self.img_size)
+        val_loader = _create_dataloader(va, 'valid', self.batch_size, self.num_workers, self.img_size) if va is not None else None
+        
+        # 訓練実行（自動でEpochループ、Backprop、最適化を実行）
+        trainer.fit(self.pl_module, train_loader, val_loader)
+        
+        # ベストモデルをロード（val_lossが最小のエポックのモデル）
+        best_model_path = os.path.join(self.model_dir, 'best.ckpt')
+        if os.path.exists(best_model_path):
+            self.pl_module = PlayerModule.load_from_checkpoint(
+                best_model_path, 
+                model_name=self.model_name, 
+                num_classes=self.num_classes,
+                embedding_dim=self.embedding_dim, 
+                arcface_s=self.arcface_s, 
+                arcface_m=self.arcface_m,
+                strict=False
+            )
+            self.pl_module.to(self.device)
+            self.logger.info(f"ベストモデルをロード: {best_model_path}")
+        
+        # プロトタイプ計算（各クラスの代表埋め込み）
+        # 推論時にcos類似度比較で分類するために使用
+        self.logger.info("プロトタイプ計算中...")
+        self.prototypes = compute_prototypes(
+            self.pl_module, 
+            train_loader, 
+            self.num_classes, 
+            self.device
+        )
+        # プロトタイプを保存（推論時にロード）
+        torch.save(self.prototypes, os.path.join(self.model_dir, 'prototypes.pth'))
         self.logger.info("訓練完了")
 
-    def _validate(self, val_loader, criterion) -> Tuple[float, float]:
-        """検証（EMAモデルを使用）"""
-        # EMAモデルを評価モードに
-        model_to_eval = self.ema.module if self.use_ema else self.model
-        model_to_eval.eval()
-        
-        val_loss = 0.0
-        val_total = 0
-        all_preds = []
-        all_labels = []
-        
-        with torch.no_grad():
-            for batch in val_loader:
-                images, labels = batch
-                images = images.to(self.device)
-                labels = labels.to(self.device)
-                
-                # 検証時はマージンなしで評価（labels=None）
-                outputs = model_to_eval(images, labels=None)
-                loss = criterion(outputs, labels)
-                
-                val_loss += loss.item() * images.size(0)
-                val_total += labels.size(0)
-                
-                # F1計算用に予測とラベルを保持
-                preds = outputs.argmax(dim=1)
-                all_preds.extend(preds.cpu().numpy())
-                all_labels.extend(labels.cpu().numpy())
-        
-        val_loss /= val_total
-        val_f1 = f1_score(all_labels, all_preds, average='macro')
-        return val_loss, val_f1
-
-    def _compute_prototypes(self, df: pd.DataFrame):
-        """クラスプロトタイプ（平均埋め込み）を計算（EMAモデルを使用）"""
-        # EMAモデルを評価モードに
-        model_to_eval = self.ema.module if self.use_ema else self.model
-        model_to_eval.eval()
-        
-        # 全データの埋め込みを抽出
-        dataloader = self._create_dataloader(df, split='train')
-        all_embeddings = []
-        all_labels = []
-        
-        with torch.no_grad():
-            for batch in tqdm(dataloader, desc="埋め込み抽出"):
-                images, labels = batch
-                images = images.to(self.device)
-                
-                embeddings = model_to_eval.get_embedding(images)
-                all_embeddings.append(embeddings.cpu())
-                all_labels.append(labels)
-        
-        all_embeddings = torch.cat(all_embeddings, dim=0)
-        all_labels = torch.cat(all_labels, dim=0)
-        
-        # クラスごとの平均を計算
-        self.prototypes = torch.zeros(self.num_classes, self.embedding_dim)
-        for c in range(self.num_classes):
-            mask = all_labels == c
-            if mask.sum() > 0:
-                class_embeddings = all_embeddings[mask]
-                prototype = class_embeddings.mean(dim=0)
-                self.prototypes[c] = F.normalize(prototype, p=2, dim=0)
-        
-        self.logger.info(f"プロトタイプ形状: {self.prototypes.shape}")
-
-    def predict(self, te: pd.DataFrame, split='test') -> np.ndarray:
+    def predict(self, te: pd.DataFrame, split='test') -> pd.DataFrame:
         """
-        予測（EMAモデルを使用）
+        テストデータの予測実行
+        
+        推論フロー:
+        1. モデルを評価モード（eval）に設定
+        2. 各バッチの画像から埋め込みベクトルを抽出（EMAモデル使用）
+        3. 全埋め込みとプロトタイプ間のcos類似度を計算
+        4. 最大類似度のクラスを予測（閾値未満は-1=unknown）
+        5. 予測分布をログ出力
+        
+        プロトタイプベース分類:
+        - similarities[i, j] = cos(embedding_i, prototype_j)
+        - 最大類似度が閾値以上 → そのクラスと予測
+        - 最大類似度が閾値未満 → unknown (-1) と予測
         
         Args:
-            te: テストデータ
-            
+            te: テストデータフレーム
+            split: 'test'または'valid'（検証データの予測時）
+        
         Returns:
-            予測ラベル（unknown は -1）
+            予測結果DataFrame（label_id列）
         """
-        self.logger.info(f"ArcFace予測開始: {len(te)}サンプル")
+        self.logger.info(f"ArcFace予測: {len(te)}サンプル")
         
-        # EMAモデルを評価モードに
-        model_to_eval = self.ema.module if self.use_ema else self.model
-        model_to_eval.eval()
+        # 評価モード（Dropout無効化、BatchNorm固定）
+        self.pl_module.eval()
         
-        # テストデータの埋め込みを抽出
-        dataloader = self._create_dataloader(te, split=split)
+        # DataLoader作成（RedBullのTestDatasetを使用）
+        dataloader = _create_dataloader(te, split, self.batch_size, self.num_workers, self.img_size)
         all_embeddings = []
         
+        # 全データの埋め込みを抽出（勾配計算不要）
         with torch.no_grad():
             for batch in tqdm(dataloader, desc="推論中"):
-                # trainがTrueの場合はタプル、Falseの場合は画像のみ
-                if split != 'test':
-                    images, _ = batch
-                else:
-                    images = batch
-                images = images.to(self.device)
-                embeddings = model_to_eval.get_embedding(images)
+                # バッチから画像を取得
+                images = batch['image'].to(self.device, non_blocking=True)  # 非同期転送
+                
+                # 埋め込み抽出（EMAモデルで安定した特徴量を取得）
+                embeddings = self.pl_module.get_embedding(images)  # [B, embedding_dim]
                 all_embeddings.append(embeddings.cpu())
         
+        # 全埋め込みを結合 [N, embedding_dim]
         all_embeddings = torch.cat(all_embeddings, dim=0)
-                
-        # プロトタイプとの類似度で予測
-        similarities = F.linear(all_embeddings, self.prototypes)  # [N, num_classes]
-        max_sims, max_indices = similarities.max(dim=1)
         
-        # 閾値判定
+        # プロトタイプとのcos類似度を計算
+        # similarities[i, j] = embedding_i · prototype_j （正規化済みなので内積=cos類似度）
+        prototypes = self.prototypes.to(all_embeddings.device)  # [num_classes, embedding_dim]
+        similarities = F.linear(all_embeddings, prototypes)  # [N, num_classes]
+        
+        # 各サンプルの最大類似度とそのクラスインデックスを取得
+        max_sims, max_indices = similarities.max(dim=1)  # [N], [N]
+        
+        # 閾値判定: 類似度が閾値未満なら-1（unknown）
         predictions = []
         for sim, idx in zip(max_sims.tolist(), max_indices.tolist()):
-            if sim < self.threshold:
-                predictions.append(-1)  # unknown
-            else:
-                predictions.append(idx)
+            predictions.append(-1 if sim < self.threshold else idx)
         
+        # 予測分布をログ出力（デバッグ・分析用）
         predictions = np.array(predictions)
-        
-        # 統計情報
         unique, counts = np.unique(predictions, return_counts=True)
         self.logger.info(f"予測分布: {dict(zip(unique, counts))}")
         
-        # 元のDataFrameのインデックスを保持
-        result = pd.DataFrame({'label_id': predictions}, index=te.index)
-        return result
+        # DataFrameで返す（Runnerの仕様に合わせる）
+        return pd.DataFrame({'label_id': predictions}, index=te.index)
 
     def save_model(self) -> None:
-        """モデルの保存"""
-        model_path = os.path.join(self.model_dir, 'model.pth')
-        proto_path = os.path.join(self.model_dir, 'prototypes.pth')
+        """
+        モデルの保存
         
-        # モデル保存
-        save_dict = {
-            'model_state_dict': self.model.state_dict(),
-            'num_classes': self.num_classes,
-        }
-        if self.use_ema:
-            save_dict['ema_state_dict'] = self.ema.module.state_dict()
-        
-        torch.save(save_dict, model_path)
-        
-        # プロトタイプ保存（計算済みの場合）
-        if self.prototypes is not None:
-            torch.save(self.prototypes, proto_path)
-        
-        self.logger.info(f"モデル保存: {model_path}")
+        注意:
+        - PyTorch Lightningが自動で best.ckpt を保存するため、ここでは追加処理不要
+        - プロトタイプも train() 内で保存済み
+        - このメソッドはRunner仕様のインターフェース実装のみ
+        """
+        self.logger.info(f"モデル保存完了: {self.model_dir}")
 
     def load_model(self) -> None:
-        """モデルの読み込み"""
-        model_path = os.path.join(self.model_dir, 'model.pth')
+        """
+        保存されたモデルとプロトタイプの読み込み
+        
+        読み込みファイル:
+        1. best.ckpt: PyTorch Lightningチェックポイント（モデル重み、ハイパーパラメータ）
+        2. prototypes.pth: 各クラスのプロトタイプ埋め込み
+        
+        用途:
+        - CV予測時に各Foldのモデルをロード
+        - 提出用予測時に全Foldのモデルをアンサンブル
+        """
+        # チェックポイントパスを構築
+        best_model_path = os.path.join(self.model_dir, 'best.ckpt')
         proto_path = os.path.join(self.model_dir, 'prototypes.pth')
         
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(f"モデルが見つかりません: {model_path}")
+        # モデルファイルの存在確認
+        if not os.path.exists(best_model_path):
+            raise FileNotFoundError(f"モデルが見つかりません: {best_model_path}")
         
-        # チェックポイント読み込み
-        checkpoint = torch.load(model_path, map_location=self.device)
-        self.num_classes = checkpoint['num_classes']
+        # PyTorch Lightningチェックポイントからモデルをロード
+        # ハイパーパラメータも自動的に復元される
+        # strict=Falseで予期しないキー（EMA重み等）を無視
+        self.pl_module = PlayerModule.load_from_checkpoint(
+            best_model_path,
+            strict=False
+        )
+        self.pl_module.to(self.device)
+        self.num_classes = self.pl_module.hparams.num_classes
         
-        # モデル作成
-        self.model = PlayerEmbeddingModel(
-            model_name=self.model_name,
-            embedding_dim=self.embedding_dim,
-            num_classes=self.num_classes,
-            pretrained=False,
-            arcface_s=self.arcface_s,
-            arcface_m=self.arcface_m,
-        ).to(self.device)
-        
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        
-        # EMA復元
-        if self.use_ema and 'ema_state_dict' in checkpoint:
-            self.ema = ModelEmaV3(self.model, decay=self.ema_decay)
-            self.ema.module.load_state_dict(checkpoint['ema_state_dict'])
-        
-        # プロトタイプ読み込み
+        # プロトタイプをロード（推論に必要）
         if os.path.exists(proto_path):
             self.prototypes = torch.load(proto_path, map_location='cpu')
         
-        self.logger.info(f"モデル読み込み: {model_path}")
+        self.logger.info(f"モデル読み込み: {best_model_path}")

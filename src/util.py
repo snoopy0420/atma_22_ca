@@ -111,6 +111,8 @@ class Submission:
             submission.to_csv(save_path, index=False, header=True)
             
             logger.info(f"提出ファイル保存: {save_path}")
+
+            return save_path
             
     
     @staticmethod
