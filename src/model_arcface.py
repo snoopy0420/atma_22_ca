@@ -12,209 +12,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import timm
-from timm.utils import ModelEmaV3
 from typing import Optional
-from pathlib import Path
 from tqdm import tqdm
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
 from torchmetrics import F1Score
-from torch.utils.data import Dataset, DataLoader
+
 
 sys.path.append(os.path.abspath('..'))
 from configs.config import *
 from src.model import Model
-
-
-# ============================================================================
-# Dataset & DataLoader (基本的にRedBullの実装をそのまま使用)
-# ============================================================================
-
-class PlayerDataset(Dataset):
-    """プレイヤー再識別用Dataset（RedBullベースライン互換）
-    
-    機能:
-    - 事前クロップ画像の読み込み（crop_dir指定時）
-    - オンザフライクロップ（パディング10%付き）
-    - 画像キャッシュ機能（cache_images=True時）
-    - RGB変換を明示的に実施
-    """
-    
-    def __init__(
-        self,
-        df: pd.DataFrame,
-        transform: A.Compose,
-        cache_images: bool = False,
-    ):
-        # self.original_indices = df.index.tolist()  # 元のインデックスを保持
-        self.df = df.reset_index(drop=True)
-        self.transform = transform
-        self.cache_images = cache_images
-        self.image_cache = {}
-        self.crop_dir = Path(DIR_TRAIN_CROPS)
-    
-    def __len__(self) -> int:
-        return len(self.df)
-    
-    def _load_image(self, img_path: Path) -> np.ndarray:
-        """画像を読み込み（キャッシュ対応）"""
-        if self.cache_images and str(img_path) in self.image_cache:
-            return self.image_cache[str(img_path)]
-        
-        img = cv2.imread(str(img_path))
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)  # BGR→RGB変換
-        
-        if self.cache_images:
-            self.image_cache[str(img_path)] = img
-        
-        return img
-    
-    def __getitem__(self, idx: int) -> dict:
-        row = self.df.iloc[idx]
-        
-        # 事前クロップ画像を直接読み込む（元のインデックスを使用）
-        # original_idx = self.original_indices[idx]
-        # crop_path = self.crop_dir / f"{original_idx}.jpg"
-        crop_path = self.crop_dir / f"{row['index']}.jpg"
-        crop = self._load_image(crop_path)
-        
-        # Albumentations変換を適用
-        transformed = self.transform(image=crop)
-        image = transformed['image']
-        
-        # 重要: rowはreset_index後のものなので、label_idは正しく対応している
-        result = {
-            'image': image,
-            'angle': row['angle'],
-            'label': torch.tensor(row['label_id'], dtype=torch.long),
-        }
-        
-        return result
-
-
-class TestDataset(Dataset):
-    """テストデータ用Dataset"""
-    
-    def __init__(
-        self,
-        df: pd.DataFrame,
-        transform: A.Compose,
-    ):
-        """
-        Args:
-            df: test_meta.csv
-            transform: Albumentations変換
-        """
-        self.df = df.reset_index(drop=True)
-        self.base_dir = DIR_INPUT
-        self.transform = transform
-    
-    def __len__(self) -> int:
-        return len(self.df)
-    
-    def __getitem__(self, idx: int) -> dict:
-
-        # rel_pathから直接画像を読み込む
-        row = self.df.iloc[idx]
-        img_path = f"{self.base_dir}/{row['rel_path']}"
-        img = cv2.imread(img_path)
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        
-        # 変換を適用
-        transformed = self.transform(image=img)
-        image = transformed['image']
-        
-        return {'image': image}
-
-
-def _create_dataloader(df: pd.DataFrame, split: str = 'train', batch_size: int=32, num_workers: int=8, img_size: int=224) -> DataLoader:
-    """
-    DataLoaderを作成
-    """
-    
-    # カスタムcollate_fn: 辞書のリストをバッチ化
-    def collate_fn(batch):
-        if split == 'test':
-            # テストデータは画像のみ
-            return {'image': torch.stack([item['image'] for item in batch])}
-        else:
-            # 訓練/検証データは辞書形式
-            return {
-                'image': torch.stack([item['image'] for item in batch]),
-                'label': torch.stack([item['label'] for item in batch]),
-                'angle': [item['angle'] for item in batch],
-            }
-    
-    # テストデータは専用Datasetを使用（rel_path対応）
-    if split == 'test':
-        dataset = TestDataset(
-            df=df,
-            transform=_get_transforms(train=False, img_size=img_size)  # テスト時変換,
-        )
-    elif split == 'train':
-        
-        dataset = PlayerDataset(
-            df=df,
-            transform=_get_transforms(train=True, img_size=img_size),
-            cache_images=False,  # 大規模データセットではメモリ不足に注意
-        )
-    elif split == 'valid':
-        
-        dataset = PlayerDataset(
-            df=df,
-            transform=_get_transforms(train=False, img_size=img_size),
-            cache_images=False,  # 大規模データセットではメモリ不足に注意
-        )
-    
-    # DataLoader作成（RedBullの設定を踏襲）
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=(split in ['train']),  # 訓練時のみシャッフル
-        num_workers=num_workers,  # マルチプロセス読み込み
-        pin_memory=True,  # GPU転送高速化
-        drop_last=(split in ['train']),  # 訓練時のみ端数バッチを削除（安定性向上）
-        persistent_workers=num_workers > 0,  # ワーカープロセスの再利用（高速化）
-        prefetch_factor=4 if num_workers > 0 else None,  # プリフェッチ数（I/O効率化）
-        collate_fn=collate_fn,  # カスタムバッチ化関数
-    )
-
-
-def _get_transforms(train: bool = True, img_size: int = 224) -> A.Compose:
-    """
-    画像変換パイプラインを取得（RedBullベースラインと同一）
-    
-    訓練時:
-    - データ拡張（Data Augmentation）で多様性を増やし過学習防止
-    - 幾何学的変換: Flip, Shift, Scale, Rotate
-    - 色変換: Brightness, Contrast, Saturation, Hue
-    
-    推論時:
-    - データ拡張なし、リサイズと正規化のみ
-    
-    Args:
-        train: 訓練モードかどうか
-    
-    Returns:
-        Albumentations変換パイプライン
-    """
-    if train:
-        return A.Compose([
-            A.Resize(img_size, img_size),  # リサイズ（例: 224x224）
-            A.HorizontalFlip(p=0.5),  # 水平反転（50%確率）
-            A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.1, rotate_limit=15, p=0.5),  # 平行移動/拡大縮小/回転
-            A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.5),  # 色調変換
-            A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),  # ImageNet統計で正規化
-            ToTensorV2(),  # NumPy配列→PyTorchテンソル変換
-        ])
-    else:
-        return A.Compose([
-            A.Resize(img_size, img_size),  # リサイズのみ
-            A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),  # ImageNet正規化
-            ToTensorV2(),
-        ])
+from src.dataset_image import _create_dataloader
+from src.util import seed_everything
 
 
 
@@ -313,102 +122,6 @@ class ArcFaceHead(nn.Module):
         return output
 
 
-class PlayerEmbeddingModel(nn.Module):
-    """
-    選手埋め込みモデル全体のアーキテクチャ
-    
-    構成:
-    1. Backbone: EfficientNet/ResNetなどの事前学習済みCNN（特徴抽出）
-       - 入力: [B, 3, H, W] RGB画像
-       - 出力: [B, backbone_dim] 特徴ベクトル（例: 1280次元）
-    
-    2. Embedding: 特徴を埋め込み空間に射影
-       - BatchNorm -> Dropout -> Linear -> BatchNorm
-       - 出力: [B, embedding_dim] 正規化された埋め込み（例: 512次元）
-    
-    3. ArcFace Head: 埋め込みから各クラスへの類似度を計算
-       - 訓練時: 角度マージンを追加した損失計算用logits
-       - 推論時: プロトタイプとのcos類似度
-    
-    使用法:
-    - 訓練: model(x, labels) -> ArcFace損失用のlogits
-    - 推論: model.get_embedding(x) -> 埋め込みベクトル（プロトタイプ比較用）
-    
-    Args:
-        model_name: Backboneモデル名（timm対応モデル）
-        embedding_dim: 埋め込み次元数（通常512）
-        num_classes: 選手クラス数
-        pretrained: ImageNet事前学習済み重みを使用するか
-        arcface_s: ArcFaceスケールパラメータ
-        arcface_m: ArcFace角度マージン
-    """
-
-    def __init__(self, model_name: str = "efficientnet_b0", embedding_dim: int = 512,
-                 num_classes: int = 11, pretrained: bool = True,
-                 arcface_s: float = 30.0, arcface_m: float = 0.5):
-        super().__init__()
-        # Backbone: 事前学習済みCNN（最終分類層なし）
-        self.backbone = timm.create_model(model_name, pretrained=pretrained, num_classes=0)
-        backbone_out = self.backbone.num_features  # Backboneの出力次元
-
-        # Embedding Layer: 特徴を低次元埋め込み空間に射影
-        self.embedding = nn.Sequential(
-            nn.BatchNorm1d(backbone_out),  # バッチ正規化
-            nn.Dropout(0.3),  # 過学習防止
-            nn.Linear(backbone_out, embedding_dim, bias=False),  # 線形射影
-            nn.BatchNorm1d(embedding_dim),  # 埋め込みの正規化
-        )
-
-        # ArcFace Head: 埋め込みをクラスlogitsに変換
-        self.arcface = ArcFaceHead(in_features=embedding_dim, out_features=num_classes,
-                                   s=arcface_s, m=arcface_m)
-        self.embedding_dim = embedding_dim
-
-    def get_embedding(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        画像から正規化された埋め込みベクトルを取得（推論用）
-        
-        処理: 画像 -> Backbone -> Embedding -> L2正規化
-        用途: プロトタイプとのcos類似度計算に使用
-        
-        Args:
-            x: 入力画像 [B, 3, H, W]
-        Returns:
-            正規化埋め込み [B, embedding_dim]、各ベクトルのL2ノルムは1
-        """
-        features = self.backbone(x)  # [B, backbone_dim]
-        embedding = self.embedding(features)  # [B, embedding_dim]
-        return F.normalize(embedding, p=2, dim=1)  # L2正規化
-
-    def forward(self, x: torch.Tensor, labels: torch.Tensor = None) -> torch.Tensor:
-        """
-        順伝播（訓練時と推論時で動作が異なる）
-        
-        訓練時（labels指定）: ArcFace損失計算用のlogitsを返す
-        推論時（labels=None）: 正規化埋め込みを返す
-        
-        Args:
-            x: 入力画像 [B, 3, H, W]
-            labels: 正解ラベル [B]（訓練時のみ）
-        
-        Returns:
-            訓練時: ArcFaceのlogits [B, num_classes]
-            推論時: 正規化埋め込み [B, embedding_dim]
-        """
-        # Backbone特徴抽出
-        features = self.backbone(x) 
-
-        # Embedding Layer: 特徴を低次元埋め込み空間に射影
-        embedding = self.embedding(features)  
-
-        if labels is not None:
-            # 訓練時: ArcFace損失用のlogits
-            return self.arcface(embedding, labels)
-        else:
-            # 推論時: 正規化埋め込み
-            return F.normalize(embedding, p=2, dim=1)
-
-
 class PlayerModule(pl.LightningModule):
     """
     PyTorch Lightning統合版の訓練モジュール
@@ -453,11 +166,22 @@ class PlayerModule(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()  # チェックポイント保存用
 
-        # メインモデル
-        self.model = PlayerEmbeddingModel(
-            model_name=model_name, num_classes=num_classes, pretrained=pretrained,
-            embedding_dim=embedding_dim, arcface_s=arcface_s, arcface_m=arcface_m
+        # Backbone: 事前学習済みCNN（最終分類層なし）
+        self.backbone = timm.create_model(model_name, pretrained=pretrained, num_classes=0)
+        backbone_out = self.backbone.num_features  # Backboneの出力次元
+
+        # Embedding Layer: 特徴を低次元埋め込み空間に射影
+        self.embedding = nn.Sequential(
+            nn.BatchNorm1d(backbone_out),  # バッチ正規化
+            nn.Dropout(0.3),  # 過学習防止
+            nn.Linear(backbone_out, embedding_dim, bias=False),  # 線形射影
+            nn.BatchNorm1d(embedding_dim),  # 埋め込みの正規化
         )
+
+        # ArcFace Head: 埋め込みをクラスlogitsに変換
+        self.arcface = ArcFaceHead(in_features=embedding_dim, out_features=num_classes,
+                                   s=arcface_s, m=arcface_m)
+        self.embedding_dim = embedding_dim
         
         # 損失関数とメトリクス
         self.criterion = nn.CrossEntropyLoss()  # ArcFace logitsに対する交差エントロピー
@@ -472,28 +196,67 @@ class PlayerModule(pl.LightningModule):
     def setup(self, stage: str = None):
         """訓練開始前にEMAモデルを初期化"""
         if self.use_ema and self.model_ema is None:
-            self.model_ema = ModelEmaV3(self.model, decay=self.ema_decay, device=self.device)
-
-    def forward(self, x: torch.Tensor, labels: torch.Tensor = None) -> torch.Tensor:
-        """メインモデルの順伝播"""
-        return self.model(x, labels)
+            self.model_ema = timm.utils.ModelEmaV3(self, decay=self.ema_decay, device=self.device)
 
     def get_embedding(self, x: torch.Tensor) -> torch.Tensor:
         """
-        埋め込み取得（推論時はEMAモデル使用）
+        画像から正規化された埋め込みベクトルを取得
         
-        プロトタイプ計算・推論時に使用
+        処理: 画像 -> Backbone -> Embedding -> L2正規化
+        用途: プロトタイプとのcos類似度計算に使用
+        
+        Args:
+            x: 入力画像 [B, 3, H, W]
+        Returns:
+            正規化埋め込み [B, embedding_dim]、各ベクトルのL2ノルムは1
+        """
+        features = self.backbone(x)  # [B, backbone_dim]
+        embedding = self.embedding(features)  # [B, embedding_dim]
+        return F.normalize(embedding, p=2, dim=1)  # L2正規化
+
+    def forward(self, x: torch.Tensor, labels: torch.Tensor = None) -> torch.Tensor:
+        """
+        順伝播（訓練時と推論時で動作が異なる）
+        
+        訓練時（labels指定）: ArcFace損失計算用のlogitsを返す
+        推論時（labels=None）: 正規化埋め込みを返す
+        
+        Args:
+            x: 入力画像 [B, 3, H, W]
+            labels: 正解ラベル [B]（訓練時のみ）
+        
+        Returns:
+            訓練時: ArcFaceのlogits [B, num_classes]
+            推論時: 正規化埋め込み [B, embedding_dim]
+        """
+        # Backbone特徴抽出
+        features = self.backbone(x)
+        
+        # Embedding Layer: 特徴を低次元埋め込み空間に射影
+        embedding = self.embedding(features)
+        
+        if labels is not None:
+            # 訓練時: ArcFace損失用のlogits
+            return self.arcface(embedding, labels)
+        else:
+            # 推論時: 正規化埋め込み
+            return F.normalize(embedding, p=2, dim=1)
+    
+    def get_embedding_ema(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        EMAモデルで埋め込み取得（推論時に使用）
+        
         EMA有効時はより安定したEMAモデルで埋め込み抽出
         """
         if self.use_ema and self.model_ema is not None:
             return self.model_ema.module.get_embedding(x)
-        return self.model.get_embedding(x)
+        return self.get_embedding(x)
 
     def forward_ema(self, x: torch.Tensor, labels: torch.Tensor = None) -> torch.Tensor:
         """EMAモデルの順伝播（検証時に使用）"""
         if self.model_ema is not None:
             return self.model_ema.module(x, labels)
-        return self.model(x, labels)
+        return self(x, labels)
 
     def on_before_zero_grad(self, optimizer):
         """
@@ -503,7 +266,7 @@ class PlayerModule(pl.LightningModule):
         θ_ema = decay * θ_ema + (1-decay) * θ_current
         """
         if self.use_ema and self.model_ema is not None:
-            self.model_ema.update(self.model)
+            self.model_ema.update(self)
 
     def training_step(self, batch: dict, batch_idx: int) -> torch.Tensor:
         images = batch["image"]
@@ -575,7 +338,7 @@ def compute_prototypes(model: PlayerModule, dataloader, num_classes: int, device
     for batch in tqdm(dataloader, desc="プロトタイプ計算"):
         images = batch["image"].to(device, non_blocking=True)  # 非同期転送で高速化
         labels = batch["label"]
-        embeddings = model.get_embedding(images)  # EMAモデル使用
+        embeddings = model.get_embedding_ema(images)  # EMAモデル使用
         
         # クラスごとに埋め込みを蓄積
         for emb, label in zip(embeddings.cpu(), labels):
@@ -614,6 +377,12 @@ class ModelArcFace(Model):
         ArcFaceモデルの初期化
         """
         super().__init__(run_fold_name, params, out_dir_name, logger)
+        
+        # シード固定（再現性確保）
+        seed = params.get('seed', 42)
+        seed_everything(seed)
+        self.logger.info(f"シード固定: {seed}")
+        
         # モデルアーキテクチャ設定
         self.model_name = params.get('model_name', 'efficientnet_b0')  # Backboneモデル
         self.embedding_dim = params.get('embedding_dim', 512)  # 埋め込み次元
@@ -707,6 +476,7 @@ class ModelArcFace(Model):
             enable_model_summary=False,  # モデル概要表示
             logger=False,  # ロガー設定
             precision="16-mixed",  # 混合精度で高速化
+            deterministic=True,  # 再現性確保（cudnnの決定性モード）
         )
 
         # DataLoader
@@ -779,7 +549,7 @@ class ModelArcFace(Model):
                 images = batch['image'].to(self.device, non_blocking=True)  # 非同期転送
                 
                 # 埋め込み抽出（EMAモデルで安定した特徴量を取得）
-                embeddings = self.pl_module.get_embedding(images)  # [B, embedding_dim]
+                embeddings = self.pl_module.get_embedding_ema(images)  # [B, embedding_dim]
                 all_embeddings.append(embeddings.cpu())
         
         # 全埋め込みを結合 [N, embedding_dim]
@@ -828,16 +598,10 @@ class ModelArcFace(Model):
         best_model_path = os.path.join(self.model_dir, 'best.ckpt')
         proto_path = os.path.join(self.model_dir, 'prototypes.pth')
         
-        # モデルファイルの存在確認
-        if not os.path.exists(best_model_path):
-            raise FileNotFoundError(f"モデルが見つかりません: {best_model_path}")
-        
         # PyTorch Lightningチェックポイントからモデルをロード
-        # ハイパーパラメータも自動的に復元される
-        # strict=Falseで予期しないキー（EMA重み等）を無視
         self.pl_module = PlayerModule.load_from_checkpoint(
             best_model_path,
-            strict=False
+            strict=False # strict=Falseで予期しないキー（EMA重み等）を無視
         )
         self.pl_module.to(self.device)
         self.num_classes = self.pl_module.hparams.num_classes

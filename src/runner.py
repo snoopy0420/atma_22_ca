@@ -12,7 +12,7 @@ from datetime import datetime
 sys.path.append(os.path.abspath('..'))
 from configs.config import *
 from src.model import Model
-from src.util import Util, Metric, Validation
+from src.util import Util, Metric, Validation, seed_everything
 
 
 class Runner:
@@ -25,7 +25,8 @@ class Runner:
                  df_train: pd.DataFrame,
                  df_test: pd.DataFrame,
                  cv_setting: dict,
-                 logger
+                 logger,
+                 seed: int = 42
                  ):
         """
         Args:
@@ -36,7 +37,12 @@ class Runner:
             df_test: テストデータ
             cv_setting: CV設定
             logger: ロガー
+            seed: ランダムシード（デフォルト: 42）
         """
+        # シード固定（再現性確保）
+        seed_everything(seed)
+        self.seed = seed
+        
         self.run_name = run_name
         self.model_cls = model_cls
         self.params = params
@@ -45,14 +51,9 @@ class Runner:
         # CV設定（validatorは必須）
         if 'validator' not in cv_setting:
             raise ValueError("cv_setting に 'validator' が必要です。Validation.create_validator()で作成してください。")
-        
         self.validator = cv_setting['validator']
         self.group_col = cv_setting.get("group_col")
         self.n_splits = getattr(self.validator, 'n_splits', getattr(self.validator, 'get_n_splits', lambda: 5)())
-        
-        # validator情報をログ出力
-        validator_name = type(self.validator).__name__
-        self.logger.info(f"CV手法: {validator_name} ({self.n_splits}-fold)")
         
         # データ
         self.df_train = df_train
@@ -228,6 +229,8 @@ class Runner:
         # 予測分布
         pred_counts = pred['label_id'].value_counts().sort_index()
         self.logger.info(f"予測分布:\n{pred_counts}")
+
+        submission = pd.DataFrame({'label_id': pred['label_id'].values})
         
         return submission
 

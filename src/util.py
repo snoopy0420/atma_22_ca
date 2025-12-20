@@ -10,6 +10,8 @@ import json
 import numpy as np
 import pandas as pd
 import joblib
+import random
+import torch
 from typing import Dict, List, Tuple, Any, Optional
 from sklearn.model_selection import (
     KFold, 
@@ -21,6 +23,23 @@ from sklearn.metrics import f1_score
 
 sys.path.append(os.path.abspath('..'))
 from configs.config import *
+
+
+def seed_everything(seed: int = 42):
+    """
+    全てのランダムシードを固定して再現性を確保
+    
+    Args:
+        seed: シード値（デフォルト: 42）
+    """
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 class Util:
