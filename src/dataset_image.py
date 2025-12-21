@@ -228,7 +228,7 @@ class PlayerDataset(Dataset):
         transform: A.Compose,
         cache_images: bool = False,
     ):
-        # self.original_indices = df.index.tolist()  # 元のインデックスを保持
+        self.original_indices = df.index.tolist()  # 元のインデックスを保持
         self.df = df.reset_index(drop=True)
         self.transform = transform
         self.cache_images = cache_images
@@ -255,9 +255,8 @@ class PlayerDataset(Dataset):
         row = self.df.iloc[idx]
         
         # 事前クロップ画像を直接読み込む（元のインデックスを使用）
-        # original_idx = self.original_indices[idx]
-        # crop_path = self.crop_dir / f"{original_idx}.jpg"
-        crop_path = self.crop_dir / f"{row['index']}.jpg"
+        original_idx = self.original_indices[idx]
+        crop_path = self.crop_dir / f"{original_idx}.jpg"
         crop = self._load_image(crop_path)
         
         # Albumentations変換を適用

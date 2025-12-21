@@ -518,58 +518,92 @@ class ModelArcFace(Model):
         """
         テストデータの予測実行
         
-        推論フロー:
-        1. モデルを評価モード（eval）に設定
-        2. 各バッチの画像から埋め込みベクトルを抽出（EMAモデル使用）
-        3. 全埋め込みとプロトタイプ間のcos類似度を計算
-        4. 最大類似度のクラスを予測（閾値未満は-1=unknown）
-        5. 予測分布をログ出力
-        
-        プロトタイプベース分類:
-        - similarities[i, j] = cos(embedding_i, prototype_j)
-        - 最大類似度が閾値以上 → そのクラスと予測
-        - 最大類似度が閾値未満 → unknown (-1) と予測
+        predict_probaで確率を取得し、最大類似度と閾値で判定
         """
         self.logger.info(f"ArcFace予測: {len(te)}サンプル")
         
-        # 元のインデックスを保存（OOF評価で正しい対応付けに必要）
+        # 元のインデックスを保存
         original_index = te.index.copy()
         
-        # 評価モード（Dropout無効化、BatchNorm固定）
+        # 確率予測（minmax正規化済み）
+        probs = self.predict_proba(te, split)  # [N, num_classes + 1]
+        
+        # unknown列を除外して最大確率のクラスを取得
+        probs_without_unknown = probs[:, :-1]  # [N, num_classes]
+        max_probs = probs_without_unknown.max(axis=1)  # [N]
+        max_indices = probs_without_unknown.argmax(axis=1)  # [N]
+        
+        # 閾値判定: minmax正規化されているので閾値を変換 (cos → [0,1])
+        # cos類似度の閾値thresholdは[-1,1]なので、(threshold + 1) / 2で[0,1]に変換
+        normalized_threshold = (self.threshold + 1.0) / 2.0
+        predictions = [-1 if prob < normalized_threshold else idx 
+                      for prob, idx in zip(max_probs, max_indices)]
+        
+        return pd.DataFrame({'label_id': predictions}, index=original_index)
+    
+    def predict_proba(self, te: pd.DataFrame, split='test') -> np.ndarray:
+        """
+        テストデータの確率予測（後処理用）
+        
+        cos類似度を[0,1]にmin-max正規化して返す
+        
+        重要: DataFrameのインデックス順序を保持する
+        DataLoaderは内部で0,1,2,...の連番でアクセスするため、
+        元のDataFrameのインデックスが連番でない場合に順序がずれる問題を回避
+        
+        Returns:
+            probs: [N, num_classes + 1] の確率配列（元のDataFrameの行順序）
+                   最後の列(index=num_classes)がunknownの確率（0.0初期化）
+        """
+        self.logger.info(f"ArcFace確率予測: {len(te)}サンプル")
+        
+        # 元のインデックスを保存（順序を保持するため）
+        original_index = te.index
+        
+        # インデックスをリセット（DataLoaderと連番を一致させる）
+        te_reset = te.reset_index(drop=True)
+        
+        # 評価モード
         self.pl_module.eval()
         
-        # DataLoader
-        dataloader = _create_dataloader(te, split, self.batch_size, self.num_workers, self.img_size)
+        # DataLoader（reset_indexした後のDataFrameを使用）
+        dataloader = _create_dataloader(te_reset, split, self.batch_size, self.num_workers, self.img_size)
         all_embeddings = []
         
-        # 全データの埋め込みを抽出（勾配計算不要）
+        # 埋め込み抽出
         with torch.no_grad():
-            for batch in tqdm(dataloader, desc="推論中"):
-
-                images = batch['image'].to(self.device, non_blocking=True)  # 非同期転送
-                
-                # 埋め込み抽出（EMAモデルで安定した特徴量を取得）
-                embeddings = self.pl_module.get_embedding_ema(images)  # [B, embedding_dim]
+            for batch in tqdm(dataloader, desc="埋め込み抽出中"):
+                images = batch['image'].to(self.device, non_blocking=True)
+                embeddings = self.pl_module.get_embedding_ema(images)
                 all_embeddings.append(embeddings.cpu())
         
-        # 全埋め込みを結合 [N, embedding_dim]
+        # 全埋め込みを結合
         all_embeddings = torch.cat(all_embeddings, dim=0)
         
-        # プロトタイプとのcos類似度を計算
-        # similarities[i, j] = embedding_i · prototype_j （正規化済みなので内積=cos類似度）
-        prototypes = self.prototypes.to(all_embeddings.device)  # [num_classes, embedding_dim]
-        similarities = F.linear(all_embeddings, prototypes)  # [N, num_classes]
+        # プロトタイプとのcos類似度
+        prototypes = self.prototypes.to(all_embeddings.device)
+        similarities = F.linear(all_embeddings, prototypes)  # [N, num_classes], range: [-1, 1]
         
-        # 各サンプルの最大類似度とそのクラスインデックスを取得
-        max_sims, max_indices = similarities.max(dim=1)  # [N], [N]
+        # min-max正規化: [-1,1] -> [0,1]
+        probs = (similarities + 1.0) / 2.0
         
-        # 閾値判定: 類似度が閾値未満なら-1（unknown）
-        predictions = []
-        for sim, idx in zip(max_sims.tolist(), max_indices.tolist()):
-            predictions.append(-1 if sim < self.threshold else idx)
+        # unknown列を追加（0.0で初期化）
+        probs_with_unknown = torch.cat([
+            probs,
+            torch.zeros(probs.shape[0], 1)
+        ], dim=1)  # [N, num_classes + 1]
         
-        # DataFrameで返す（元のインデックスを使用してRunnerでの評価を正確に）
-        return pd.DataFrame({'label_id': predictions}, index=original_index)
+        probs_array = probs_with_unknown.numpy()
+        
+        # 元のインデックス順序に並び替え
+        # （今回はreset_indexしているので実際には並び替え不要だが、
+        #   将来的なインデックス変更に対応するためのロジック）
+        # DataFrameとして一時保存して元の順序に戻す
+        probs_df = pd.DataFrame(probs_array, index=te_reset.index)
+        
+        # 元のインデックスがte_resetと一致しているため、そのまま返す
+        # （念のため、将来的に非連番インデックスに対応）
+        return probs_array
 
     def save_model(self) -> None:
         """
